@@ -1,0 +1,230 @@
+# CookieCheetah Bot (Railway)
+
+บอท Discord ของเซิฟ Cookie Cheetah ทุกอย่างอยู่ใน Discord ไม่ต้องใช้ panel
+
+- **ต้อนรับ + Ticket** (thread ส่วนตัวในห้องเดียว): 📝 ขอ White List · 💝 Donate · 🐛 แจ้งบั๊ก · 🚨 รีพอร์ต · 💬 ติดต่อแอดมิน
+- **White List + เช็ค Steam** → อนุมัติแล้วได้ role คุกกี้ + วิธีเข้าเซิฟ + ปุ่มไปห้อง server-info (ไม่แจก username/รหัสแล้ว ผู้เล่นตั้งเองในเกม)
+- **แจ้งบั๊ก / ติดต่อแอดมิน**: บอทถามตอบก่อน (กดปุ่มหรือพิมพ์เลข) ไม่หายค่อยส่งต่อแอดมิน · จบกับบอท = ลบห้องเอง
+- **Donate ผ่าน Stripe** (PromptPay / บัตร) → ของที่ผูกรหัส Cookie Express ส่งเข้าเกมเอง · แพ็กคุกกี้เข้ากระเป๋าเอง
+- **คุกกี้ 🍪**: หมุนวงล้อรายวัน · กระเป๋าส่วนตัว · ร้านแลกของ → ส่งเข้าเกมผ่าน Cookie Express · หน้าเว็บแคตตาล็อก
+- **ห้องสรุป ticket ของแอดมิน** อัปเดตในข้อความเดิม · **สรุปคนที่ยังไม่ขอ White List ทุกวัน** กดปุ่มเดียวส่งการ์ดแท็กใน newbie
+
+---
+
+## 1. อัปเดตจากเวอร์ชันก่อน (ทำครั้งเดียว)
+
+### 1.1 อัปไฟล์ขึ้น GitHub
+วางทับใน repo เดิม (โฟลเดอร์ `cookiecheetah-railway`):
+
+```
+bot.py            ← แก้
+faq_engine.py     ← ใหม่
+ckx_link.py       ← ใหม่
+web_catalog.py    ← ใหม่
+faq.json          ← ใหม่ (คำถาม-คำตอบของ ticket แจ้งบั๊ก)
+assets/faq/       ← ใหม่ (รูปประกอบคำตอบ 3 รูป)
+.env.example · README.md
+```
+`Dockerfile` `railway.toml` `requirements.txt` ไม่ต้องแก้ · ข้อมูลเดิม (ticket, White List, Donate) อยู่ครบ บอทเติมตารางใหม่ให้เองตอนเปิด
+
+### 1.2 Developer Portal
+https://discord.com/developers/applications → บอท → **Bot** → Privileged Gateway Intents → เปิดทั้ง 2 ตัว
+- **SERVER MEMBERS INTENT** — ดึงทีมแอดมินเข้า ticket + หาคนที่ยังไม่ขอ White List
+- **MESSAGE CONTENT INTENT** — transcript + เลขที่ผู้เล่นพิมพ์ตอบบอท + อ่านข้อความจาก Cookie Express relay
+
+### 1.3 Railway
+1. **Variables** → Raw Editor → เพิ่มตัวใหม่จาก `.env.example` (หัวข้อ "ใหม่") แล้วแก้ `GAME_VERSION=Build 42.21.0`
+2. **โดเมนฟรีสำหรับหน้าเว็บร้าน**: service บอท → **Settings → Networking → Generate Domain** (ถ้าถามพอร์ต ใส่ `8080`) — บอทอ่านโดเมนจาก `RAILWAY_PUBLIC_DOMAIN` เอง ไม่ต้องตั้งอะไรเพิ่ม · รูปของในร้าน Discord ก็ใช้โดเมนนี้
+3. Volume ที่ `/data` ใช้ตัวเดิม (รูปของในร้านเก็บใน `/data/images`)
+
+### 1.4 สร้างห้อง + สิทธิ์
+| ห้อง | Variable | @everyone | role บอทต้องมี |
+|---|---|---|---|
+| ห้องสรุป ticket (แอดมินเท่านั้น) | `TICKET_BOARD_CHANNEL_ID` | ❌ ไม่เห็น | View · Send · Embed Links · Read History |
+| ห้องแอดมินรับสรุปรายวัน | `ADMIN_ALERT_CHANNEL_ID` (ว่าง = mod-logs) | ❌ | เหมือนบน |
+| newbie-cookies | `NEWBIE_CHANNEL_ID` | ✅ เห็น | View · Send · Embed Links |
+| วิธีเข้าเซิฟ (ห้องที่มีปุ่ม Join) | `JOIN_CHANNEL_ID` | ✅ | — (ใช้ทำลิงก์) |
+| server-info | `CONNECT_INFO_CHANNEL_ID` | ตามเดิม (เห็นเมื่อมี role คุกกี้) | — |
+| 🎡 วงล้อรายวัน | `SPIN_CHANNEL_ID` | View · Read History · ❌ Send Messages | View · Send · Embed · Read History · **Create Private Threads** · **Manage Threads** · Send in Threads |
+| 🛍️ ร้านแลกของ | `REDEEM_CHANNEL_ID` | View · Read History · ❌ Send Messages | View · Send · Embed Links |
+| log แลกของ (แอดมิน) | `REDEEM_LOG_CHANNEL_ID` (ว่าง = donate-log) | ❌ | View · Send · Embed |
+| ห้องลับ Cookie Express relay | `CKX_CHANNEL_ID` | ❌ | View · Send · Read History |
+
+- กระเป๋าคุกกี้ของแต่ละคนเป็น **private thread ในห้องวงล้อ** (หรือแยกห้องด้วย `WALLET_CHANNEL_ID`) — ทีมแอดมินต้องมี **Manage Threads** ในห้องนั้นถึงจะเห็นกระเป๋าทุกคน
+- ห้องวงล้อ: @everyone ต้องเห็นห้อง (View + Read History) ไม่งั้นเปิดกระเป๋าตัวเองไม่ได้ · ปิด Send Messages ในห้องหลักได้
+
+### 1.5 ต่อกับ Cookie Express relay
+1. คลิกขวาบอทนี้ → Copy User ID → ใส่ใน `allowed_user_ids` ของ `relay_config.json` บนเครื่องเซิฟ แล้วปิดเปิด relay
+2. คลิกขวาบอท relay → Copy User ID → ใส่ `CKX_RELAY_BOT_ID` (บอทจะเชื่อเฉพาะข้อความจาก relay)
+3. ห้อง `CKX_CHANNEL_ID` = ห้องเดียวกับที่ relay อ่าน (`channel_id` ใน relay_config.json)
+
+### 1.6 ตั้งค่าครั้งแรกใน Discord (ทำตามลำดับ)
+```
+/setting joininfo                          ← วางข้อความวิธีเข้าเซิฟ (Radmin + IP + ลิงก์ม็อด) ที่จะแปะตอนอนุมัติ WL
+/spin add label:คุกกี้ชิ้นเล็ก cookies:10 weight:60
+/spin add label:คุกกี้ชิ้นกลาง cookies:30 weight:30
+/spin add label:กล่องคุกกี้ cookies:100 weight:9
+/spin add label:แจ็กพอต cookies:500 weight:1   ← /spin list ดู % และค่าเฉลี่ยต่อเดือน
+/setting cookie_rate cookies_per_baht:10     ← เติมตามยอด 1 บาท = 10 คุกกี้ (0 = ปิด)
+/item add code:CK100 name:แพ็กคุกกี้ 1,200 price:100 cookies:1200   ← แพ็กคุกกี้ (ไม่บังคับ)
+/shop add code:KEY name:Cookie Master Key price:800 ckx:CX-BKSP-KTPN limit:1 image:<แนบรูป>
+/panel kind:spin channel:#วงล้อ
+/panel kind:shop channel:#ร้านแลกของ
+/board                                      ← สร้างการ์ดสรุป ticket
+/check                                      ← ต้องไม่มี ❌
+```
+
+---
+
+## 2. ตั้งค่าพื้นฐาน (ถ้าตั้งบอทใหม่ทั้งหมด)
+
+### 2.1 Variables ที่ต้องมี
+| Variable | ใส่อะไร |
+|---|---|
+| `DISCORD_TOKEN` | token บอท |
+| `GUILD_ID` | ID เซิฟ Discord |
+| `ROLE_SURVIVOR` | role ที่ได้หลังผ่าน White List (role **คุกกี้**) |
+| `ROLE_STAFF` | role ทีมแอดมิน (หลายอันคั่นด้วย `,`) |
+| `TICKET_CHANNEL_ID` | ห้อง ticket ห้องเดียว |
+| `TRANSCRIPT_CHANNEL_ID` | ห้องเก็บบทสนทนาตอนปิด ticket |
+| `STRIPE_SECRET_KEY` | ใส่เมื่อพร้อมเปิด Donate |
+
+ID หาได้จาก: Discord → User Settings → Advanced → เปิด **Developer Mode** → คลิกขวาที่ห้อง/role/คน → **Copy ID**
+
+### 2.2 ห้อง ticket
+| ใคร | ✅ อนุญาต | ❌ ปิด |
+|---|---|---|
+| @everyone | View Channel · Send Messages in Threads · Read Message History | Send Messages · Create Public Threads · Create Private Threads |
+| role ทีมแอดมิน | View Channel · Send Messages in Threads · **Manage Threads** · Read Message History | |
+| role บอท | View · Send · Send in Threads · **Create Private Threads** · **Manage Threads** · Embed Links · Attach Files · Read History | |
+
+ใส่ role ทีม (`ROLE_STAFF`) ให้ตัวเองด้วย บอทดึงทุกคนที่มี role นี้เข้า ticket และแท็กเป็นรายคน · ลาก role บอทให้อยู่**เหนือ** role คุกกี้
+
+### 2.3 Stripe
+1. บัญชี Stripe ประเทศไทย → Settings → Payments → Payment methods → เปิด **PromptPay**
+2. Developers → API keys → ก๊อป Secret key (`sk_test_` ตอนทดสอบ, `sk_live_` ใช้จริง) → ใส่ `STRIPE_SECRET_KEY`
+3. ไม่ต้องตั้ง Webhook — บอทเช็คบิลเองทุก ~20 วินาที
+
+---
+
+## 3. คำสั่ง
+
+### แอดมิน (Manage Server)
+| คำสั่ง | ทำอะไร |
+|---|---|
+| `/panel kind:welcome / ticket / donate / spin / shop` | ส่งป้ายลงห้อง (ป้ายวงล้อ/ร้านอัปเดตเองเมื่อแก้รางวัล/อัตรา) |
+| `/setting joininfo` | ข้อความวิธีเข้าเซิฟ (`{server_info}` `{collection}` = ลิงก์ห้อง/คอลเลกชันม็อด) |
+| `/setting remind_text` | ข้อความการ์ดเตือนขอ White List (`{join}` = ลิงก์ห้องวิธีเข้าเซิฟ) |
+| `/setting cookie_rate` · `/setting show` | อัตราเติมคุกกี้ · ดูค่าที่ตั้งไว้ |
+| `/spin add / edit / remove / list / reset` | รางวัลวงล้อ (น้ำหนักมาก = ออกบ่อย) · `reset member:` ให้หมุนวันนี้ได้อีก |
+| `/shop add / edit / remove / list` | ของในร้านคุกกี้ (ดูข้อ 4.4) |
+| `/cookies give / take / balance` | ให้/หัก/ดูคุกกี้ของผู้เล่น |
+| `/item add / edit / remove / list` | รายการ Donate (เพิ่มช่อง `cookies:` = แพ็กคุกกี้ · `ckx:` = รหัสของในเกม ส่งเองหลังจ่าย) |
+| `/check` | ตรวจสิทธิ์ทุกห้อง + intent + Steam + Stripe + faq.json + โดเมนเว็บ |
+| `/remind` · `/board` | สรุปคนยังไม่ขอ WL ตอนนี้ · อัปเดตห้องสรุป ticket ทันที |
+
+### ทีมแอดมิน (Manage Threads)
+```
+/order list · /order deliver order_id:12 · /order check order_id:12
+/redeem list problem_only:True · /redeem action redeem_id:15 action:คืนคุกกี้(แอดมิน)|ส่งเข้าเกมอีกครั้ง|บันทึกว่าส่งให้แล้ว
+/ticket add · /ticket remove · /ticket close · /whitelist remove · /whitelist info · /steam info|lookup|unlink
+```
+
+---
+
+## 4. Flow
+
+### 4.1 ขอ White List
+1. 🍪 Join → 📝 ขอ White List → กรอก Steam · **ชื่อในเกมที่จะตั้ง** · ช่วงเวลาออน · รู้จักจากไหน · รหัสลับ
+2. แอดมินกด ✅ อนุมัติ → ยืนยัน → บอทให้ role **คุกกี้** + แปะ **วิธีเข้าเซิฟ** (จาก `/setting joininfo`) + ปุ่ม **ไปห้อง Server info** ในห้อง ticket และ DM → ปิด ticket
+3. ผู้เล่นตั้ง Username / Password เองตอนเข้าเซิฟครั้งแรก · ชื่อที่กรอกไว้กลายเป็น **ชื่อรับของในเกม** (แก้เองได้ในกระเป๋า)
+
+### 4.2 แจ้งบั๊ก / ติดต่อแอดมิน (บอทถามตอบก่อน)
+- เปิดห้องทันที ไม่มีฟอร์ม → บอทโชว์เมนูจาก `faq.json` → ผู้เล่นกดปุ่ม **หรือพิมพ์เลข** → คำตอบ + "ติดขั้นไหนกดเลขนั้น" → ลึกลงไปเรื่อยๆ
+- ทุกหน้ามีปุ่ม **คุยกับแอดมิน** (หรือพิมพ์ `0`) → บอทดึงทีมแอดมินเข้าห้อง + แท็ก + สรุปว่าผู้เล่นลองอะไรไปแล้ว
+- ระหว่างคุยกับบอท แอดมิน**ไม่ถูกดึง/ไม่ถูกแท็ก** ห้องสรุปขึ้น 🤖
+- **จบกับบอท** (กด "แก้ได้แล้ว" หรือ 🔒 ปิดห้อง) → ลบห้องทันที ไม่เก็บ transcript (mod-logs จด 1 บรรทัดว่าแก้ได้ด้วยข้อไหน)
+- **โหมดคุยกับแอดมิน** → ปุ่มปิดให้เลือก 🔒 ปิดเก็บไว้ / ⛔ ปิดและลบ (ผู้เล่นหรือแอดมินกดได้)
+- ติดต่อแอดมิน → ถามก่อนว่าเรื่องนี้ตรงกับหัวข้อในเมนูไหม ไม่ตรงค่อยเรียกแอดมิน
+- เปิดใหม่ได้เลขใหม่ทุกครั้ง (bug-0001, bug-0002 …)
+
+### 4.3 วงล้อ + กระเป๋า
+- ห้องวงล้อ → 🎡 **หมุนเลย** วันละครั้ง (รีเซ็ตเที่ยงคืน) → ผลเห็นคนเดียว หายเองใน 5 นาที (`SPIN_RESULT_SECONDS`)
+- หมุนครั้งแรก → บอทสร้าง **กระเป๋า** = private thread `🍪 ชื่อ` (อยู่ถาวร): ยอดคุกกี้ · วันนี้หมุนได้อะไร · ชื่อในเกม · ประวัติ · ใบแลกของ + ปุ่ม 🛒 เปิดร้าน / 🎮 ชื่อในเกม
+- แอดมินเห็นกระเป๋าทุกคน (Manage Threads) แต่บอทไม่แท็กแอดมินในกระเป๋า
+
+### 4.4 ร้านแลกของ
+- ห้องร้าน → 🛒 **เปิดร้าน** → หน้าร้านเห็นคนเดียว: รูป · ชื่อ · คำอธิบาย · ราคา · จำกัดต่อคน · สต็อก · ช่วงเวลา · แยกหมวด · หน้าละ 4 ชิ้น
+- ปุ่มแลกบอกเองว่า "ขาดอีก X 🍪" / "หมดแล้ว" / "ยังไม่เปิด" · ของที่หมดเวลาซ่อนเอง
+- แลก → ใส่ชื่อในเกม (+ จำนวน) → หักคุกกี้ → **ใบแลก RD-0001** ในกระเป๋า + log แอดมิน → บอทโพสต์คำสั่งให้ Cookie Express relay → ของขึ้นในเกม (จอแก้ว)
+- สถานะในใบแลกเปลี่ยนเอง: ⏳ ส่งคำสั่งแล้ว → 📦 อยู่ในคิว → 👀 ขึ้นในเกมแล้ว → ✅ รับในเกมแล้ว
+- **คืนคุกกี้อัตโนมัติ**: relay ปฏิเสธทั้งคำสั่ง หรือออเดอร์ถูกยกเลิกก่อนรับ · **รอแอดมิน**: เซิฟบอกว่ารหัสใช้ไม่ได้/ส่งไม่ครบ (⚠️ + ปุ่มคืนคุกกี้/ส่งใหม่ใน log)
+- ปุ่ม **คืนคุกกี้** กดได้เฉพาะแอดมิน และเฉพาะใบที่ผู้เล่นยังไม่ได้รับของ — บอทยกเลิกออเดอร์ใน relay ก่อนแล้วค่อยคืน · ถ้าผู้เล่นกดรับในเกมพอดีหลังคืน บอทแท็กแอดมินให้ดู
+- ของที่ไม่มีรหัส Cookie Express (เช่น ยศ Discord) → 🙋 แท็กแอดมิน → กด 📦 ส่งให้แล้ว
+- **หน้าเว็บแคตตาล็อก**: `https://<โดเมน Railway>/` ดูรูปใหญ่/รายละเอียด มีปุ่มกลับไปแลกใน Discord (แลกบนเว็บไม่ได้ — ไม่ต้องทำระบบล็อกอิน)
+
+`/shop add` ช่องที่ใช้บ่อย: `ckx:` รหัส CX-/CV- (หลายชิ้น `CX-AAAA-BBBB*2 CV-CCCC-DDDD`) · `limit:` ต่อคน (0 = ไม่จำกัด) · `stock:` ทั้งหมด (-1 = ไม่จำกัด) · `start:` / `end:` เช่น `31/10/2026 23:59` (ปี พ.ศ. ได้) · `image:` แนบรูป · `category:` หมวด · `/shop edit` ใส่ `-` เพื่อลบช่องข้อความ
+
+### 4.5 Donate → คุกกี้ / ของในเกม
+- ห้อง Donate มีปุ่ม 🍪 **เติมคุกกี้** (ตามอัตรา `/setting cookie_rate`) + แพ็กคุกกี้จาก `/item` ใส่ตะกร้าปนกับของอื่นได้
+- รายการที่มี `ckx:` → ตอนยืนยันบอทถามชื่อในเกม (ถ้ายังไม่รู้) → จ่ายแล้วส่งเข้าเกมเอง
+- จ่ายแล้ว: คุกกี้เข้ากระเป๋าทันที · ของ ckx เข้าคิวในเกม (การ์ดโชว์สถานะ 📦 → 👀 → ✅) · ไม่มีรายการส่งมือ → พอผู้เล่นกดรับในเกม บอทปิดออเดอร์เป็น "ส่งแล้ว" เอง ไม่แท็กแอดมิน · มีรายการส่งมือ หรือส่งเข้าเกมไม่สำเร็จ → แท็กแอดมิน + ปุ่ม 📦
+- บอทรีสตาร์ทกลางทาง (จ่ายแล้วแต่ยังไม่ได้เติม/ส่ง) → ทำต่อให้เองตอนเปิด
+
+### 4.6 ห้องสรุป ticket (แอดมิน)
+- การ์ดละ 1 ประเภท (White List · Donate · แจ้งบั๊ก · รีพอร์ต · ติดต่อแอดมิน · แลกของ) **แก้ในข้อความเดิม** ไม่ส่งใหม่
+- เรียงจากด่วนสุด: 💝 จ่ายแล้วรอส่งของ · 🔴 ยังไม่มีแอดมินตอบ · 🟡 ผู้เล่นตอบล่าสุด · 🟢 ตอบแล้วรอผู้เล่น · 💳 รอจ่าย · 🛒 กำลังเลือก · 🤖 คุยกับบอท · ⚫ ปิดใน 24 ชม.
+- กดเลข ticket = กระโดดไปห้องนั้น · มีเวลาเปิด + เวลาข้อความล่าสุด
+- Discord ไม่บอกบอทว่าใคร "อ่าน" แล้ว — สถานะนับจาก **ใครพิมพ์ล่าสุด** (แอดมิน = คนที่มี role ทีม)
+
+### 4.7 เตือนคนที่ยังไม่ขอ White List
+- ทุกวัน 20:00 (`WL_REMIND_HOUR`) บอทสรุปในห้องแอดมิน: คนที่**ไม่มี role อะไรเลย** + เข้าดิสมาเกิน 3 วัน + ไม่เคยเปิด ticket ขอ WL
+- ปุ่ม 📣 **ส่งเตือนใน newbie** → การ์ดเดียวแท็กรวมทุกคน + ปุ่มไปห้องวิธีเข้าเซิฟ · 📝 แก้ข้อความ · ⏩ ข้าม
+- คนเดิมโดนแท็กซ้ำได้ทุก 3 วัน (`WL_REMIND_REPEAT_DAYS`) · ไม่มีใครค้าง = ไม่ส่งการ์ด
+
+---
+
+## 5. แก้คำถามตอบของบอท (`faq.json`)
+```json
+"connect": {
+  "title": "เข้าเซิฟไม่ได้",
+  "text": "ข้อความคำตอบ (markdown ได้)",
+  "images": ["radmin_join.png"],
+  "ask": "ติดขั้นไหนกดเลขนั้นได้เลยค่ะ",
+  "options": [
+    {"n": 9, "label": "เข้าได้แล้ว", "go": "@solved"},
+    {"n": 1, "label": "หาไอคอนไม่เจอ", "go": "connect_icon"},
+    {"n": 0, "label": "คุยกับแอดมิน", "go": "@admin"}
+  ]
+}
+```
+- `go`: ชื่อข้ออื่น · `@solved` แก้ได้แล้ว · `@admin` เรียกแอดมิน · `@menu` เมนูแรก
+- `{server_info}` `{collection}` `{join}` `{spin}` `{redeem}` บอทแทนเป็นลิงก์ให้เอง
+- รูปวางใน `assets/faq/` · แก้แล้ว push → `/check` ต้องขึ้น `✅ faq.json N ข้อ` (ถ้าไฟล์ผิด บอทบอกบรรทัดที่ผิด และ ticket จะส่งตรงถึงแอดมินแทน)
+
+---
+
+## 6. ปัญหาที่เจอบ่อย
+| อาการ | แก้ |
+|---|---|
+| บอท restart วน | Deploy Logs บอกว่า Variable ไหนผิด · `ต้องเปิด SERVER MEMBERS INTENT…` = ข้อ 1.2 |
+| แอดมินไม่เห็น ticket / กระเป๋า | ใส่ role ทีมให้ตัวเอง + role ทีมต้องมี **Manage Threads** ในห้องนั้น |
+| กดหมุนแล้วไม่ได้กระเป๋า | `/check` ดูห้องวงล้อ: บอทต้อง Create Private Threads + Manage Threads · @everyone ต้อง View + Read History |
+| ใบแลกค้าง "⏳ ส่งคำสั่งแล้ว" | relay ไม่ได้รัน หรือไม่ได้ใส่ ID บอทนี้ใน `allowed_user_ids` (relay ตอบ 🚫) — เปิด relay แล้วจะทำต่อเอง |
+| ใบแลกค้าง "⏳ รอส่งคำสั่ง" | บอทส่งเข้าห้อง relay ไม่ได้ — `/check` ดู `CKX_CHANNEL_ID` (บอทลองใหม่ทุกนาที) |
+| ของในร้านไม่มีรูป | ยังไม่ได้ Generate Domain (ข้อ 1.3) |
+| ห้องสรุปไม่ขยับ | `/board` · การ์ดถูกลบ = บอทส่งใหม่ให้ |
+| สรุปรายวันไม่มา | ไม่มีใครเข้าเงื่อนไข (ลอง `/remind`) หรือ `/check` ห้องแอดมิน |
+
+## 7. ข้อควรรู้
+- คุกกี้ทุกการเปลี่ยนแปลงมีบันทึก (`/cookies balance`) · เติมจาก Donate ครั้งเดียวต่อออเดอร์ แม้บอทเช็คบิลซ้ำ
+- relay ใช้ id ข้อความเป็นเลขออเดอร์ → บอทกันโพสต์คำสั่งซ้ำ · relay ปิดอยู่ ออเดอร์ไม่หาย ทำต่อเมื่อเปิด · บอทปิดอยู่ (Railway deploy) ตอน relay ตอบ → เปิดมาบอทอ่านย้อนหลังให้
+- คืนเงิน Donate ทำใน Stripe Dashboard · คืนคุกกี้ใช้ปุ่มใน log หรือ `/redeem action`
+- ลบกระเป๋า (thread) ทิ้งได้ ยอดคุกกี้ไม่หาย สร้างใหม่ตอนใช้ครั้งหน้า
+
+### รันในเครื่อง (ทดสอบ)
+```bash
+pip install -r requirements.txt
+cp .env.example .env      # ใส่ค่า
+python bot.py             # หน้าเว็บที่ http://localhost:8080
+```
