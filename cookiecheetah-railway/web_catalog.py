@@ -1,230 +1,153 @@
-# CookieCheetah Bot (Railway)
+"""หน้าเว็บแคตตาล็อกร้านคุกกี้ — บอทเปิดเองใน service เดิมบน Railway (ไม่ต้อง host เพิ่ม)
 
-บอท Discord ของเซิฟ Cookie Cheetah ทุกอย่างอยู่ใน Discord ไม่ต้องใช้ panel
+GET /            หน้าร้าน (อ่านอย่างเดียว กดแลกในดิสคอร์ด)
+GET /img/<ไฟล์>  รูปของ (เก็บใน Volume)
+GET /health      ให้ Railway เช็คว่าบอทยังอยู่
+"""
+import html
+import re
+from datetime import datetime
+from pathlib import Path
 
-- **ต้อนรับ + Ticket** (thread ส่วนตัวในห้องเดียว): 📝 ขอ White List · 💝 Donate · 🐛 แจ้งบั๊ก · 🚨 รีพอร์ต · 💬 ติดต่อแอดมิน
-- **White List + เช็ค Steam** → อนุมัติแล้วได้ role คุกกี้ + วิธีเข้าเซิฟ + ปุ่มไปห้อง server-info (ไม่แจก username/รหัสแล้ว ผู้เล่นตั้งเองในเกม)
-- **แจ้งบั๊ก / ติดต่อแอดมิน**: บอทถามตอบก่อน (กดปุ่มหรือพิมพ์เลข) ไม่หายค่อยส่งต่อแอดมิน · จบกับบอท = ลบห้องเอง
-- **Donate ผ่าน Stripe** (PromptPay / บัตร) → ของที่ผูกรหัส Cookie Express ส่งเข้าเกมเอง · แพ็กคุกกี้เข้ากระเป๋าเอง
-- **คุกกี้ 🍪**: หมุนวงล้อรายวัน · กระเป๋าส่วนตัว · ร้านแลกของ → ส่งเข้าเกมผ่าน Cookie Express · หน้าเว็บแคตตาล็อก
-- **ห้องสรุป ticket ของแอดมิน** อัปเดตในข้อความเดิม · **สรุปคนที่ยังไม่ขอ White List ทุกวัน** กดปุ่มเดียวส่งการ์ดแท็กใน newbie
+from aiohttp import web
 
----
+IMAGE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,40}\.(png|jpe?g|webp|gif)$", re.IGNORECASE)
+THAI_MONTHS = ("ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.")
 
-## 1. อัปเดตจากเวอร์ชันก่อน (ทำครั้งเดียว)
 
-### 1.1 อัปไฟล์ขึ้น GitHub
-วางทับใน repo เดิม (โฟลเดอร์ `cookiecheetah-railway`):
+def thai_date(dt: datetime) -> str:
+    return f"{dt.day} {THAI_MONTHS[dt.month - 1]} {dt.strftime('%H:%M')}"
 
-```
-bot.py            ← แก้
-faq_engine.py     ← ใหม่
-ckx_link.py       ← ใหม่
-web_catalog.py    ← ใหม่
-faq.json          ← ใหม่ (คำถาม-คำตอบของ ticket แจ้งบั๊ก)
-assets/faq/       ← ใหม่ (รูปประกอบคำตอบ 3 รูป)
-.env.example · README.md
-```
-`Dockerfile` `railway.toml` `requirements.txt` ไม่ต้องแก้ · ข้อมูลเดิม (ticket, White List, Donate) อยู่ครบ บอทเติมตารางใหม่ให้เองตอนเปิด
 
-### 1.2 Developer Portal
-https://discord.com/developers/applications → บอท → **Bot** → Privileged Gateway Intents → เปิดทั้ง 2 ตัว
-- **SERVER MEMBERS INTENT** — ดึงทีมแอดมินเข้า ticket + หาคนที่ยังไม่ขอ White List
-- **MESSAGE CONTENT INTENT** — transcript + เลขที่ผู้เล่นพิมพ์ตอบบอท + อ่านข้อความจาก Cookie Express relay
+CSS = """
+:root{--bg:#fff8ef;--card:#ffffff;--ink:#3b2a20;--muted:#8a7464;--line:#f0e2d2;--brown:#8b5a2b;
+--pink:#f06292;--pink-soft:#fde4ec;--mint:#2fbf8f;--amber:#e6a23c;--grey:#b9aa9c;--chip:#f7ecdf;
+--spot:rgba(139,90,43,.07)}
+@media (prefers-color-scheme:dark){:root{--bg:#1d1714;--card:#28201b;--ink:#f6ebe0;--muted:#bfa995;
+--line:#3a2e26;--brown:#e0a96d;--pink:#ff8ab0;--pink-soft:#3e2430;--chip:#352a22;--spot:rgba(224,169,109,.06)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 "IBM Plex Sans Thai","Sarabun",system-ui,sans-serif}
+header{position:relative;overflow:hidden;padding:44px 20px 36px;text-align:center;border-bottom:1px solid var(--line);
+background-image:radial-gradient(var(--spot) 18%,transparent 19%),radial-gradient(var(--spot) 12%,transparent 13%);
+background-size:46px 46px,46px 46px;background-position:0 0,23px 23px}
+h1{margin:0;font:600 clamp(28px,6vw,44px)/1.1 "Mitr",sans-serif;color:var(--brown);letter-spacing:.5px}
+h1 span{display:inline-block;transform:rotate(-8deg)}
+.sub{margin:10px auto 0;max-width:560px;color:var(--muted)}
+.cta{display:inline-flex;gap:8px;align-items:center;margin-top:20px;padding:11px 20px;border-radius:999px;
+background:var(--pink);color:#fff;text-decoration:none;font-weight:600;box-shadow:0 6px 18px rgba(240,98,146,.28)}
+.cta:hover{filter:brightness(1.05)}
+nav{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;padding:18px 16px 4px}
+nav button{border:1px solid var(--line);background:var(--card);color:var(--ink);padding:7px 14px;border-radius:999px;
+font:inherit;font-size:14px;cursor:pointer}
+nav button[aria-pressed=true]{background:var(--brown);border-color:var(--brown);color:#fff}
+main{max-width:1120px;margin:0 auto;padding:16px 16px 56px;display:grid;gap:18px;
+grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+.item{background:var(--card);border:1px solid var(--line);border-radius:18px;overflow:hidden;display:flex;flex-direction:column}
+.pic{aspect-ratio:1/1;background:var(--chip);display:grid;place-items:center;position:relative}
+.pic img{width:100%;height:100%;object-fit:contain;image-rendering:auto}
+.pic .ph{font-size:64px;opacity:.55}
+.state{position:absolute;top:10px;left:10px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;color:#fff}
+.state.soon{background:var(--amber)}.state.ended,.state.soldout{background:var(--grey)}.state.hot{background:var(--pink)}
+.body{padding:14px 16px 16px;display:flex;flex-direction:column;gap:8px;flex:1}
+.cat{align-self:flex-start;font-size:12px;color:var(--muted);background:var(--chip);padding:2px 9px;border-radius:999px}
+h2{margin:0;font:600 18px/1.3 "Mitr",sans-serif}
+.desc{margin:0;color:var(--muted);font-size:14px;white-space:pre-line}
+.meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto;padding-top:6px}
+.meta span{font-size:12px;border:1px dashed var(--line);padding:2px 8px;border-radius:8px;color:var(--muted)}
+.price{display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--line);padding:12px 16px}
+.price b{font:600 20px "Mitr",sans-serif;color:var(--brown)}
+.price small{color:var(--muted);font-size:12px}
+.item.off{opacity:.62}
+.empty{grid-column:1/-1;text-align:center;color:var(--muted);padding:60px 0}
+footer{text-align:center;color:var(--muted);font-size:13px;padding:0 16px 32px}
+"""
 
-### 1.3 Railway
-1. **Variables** → Raw Editor → เพิ่มตัวใหม่จาก `.env.example` (หัวข้อ "ใหม่") แล้วแก้ `GAME_VERSION=Build 42.21.0`
-2. **โดเมนฟรีสำหรับหน้าเว็บร้าน**: service บอท → **Settings → Networking → Generate Domain** (ถ้าถามพอร์ต ใส่ `8080`) — บอทอ่านโดเมนจาก `RAILWAY_PUBLIC_DOMAIN` เอง ไม่ต้องตั้งอะไรเพิ่ม · รูปของในร้าน Discord ก็ใช้โดเมนนี้
-3. Volume ที่ `/data` ใช้ตัวเดิม (รูปของในร้านเก็บใน `/data/images`)
+JS = """
+const btns=[...document.querySelectorAll('nav button')];
+btns.forEach(b=>b.addEventListener('click',()=>{
+  btns.forEach(x=>x.setAttribute('aria-pressed',x===b));
+  const c=b.dataset.cat;
+  document.querySelectorAll('.item').forEach(el=>{el.hidden=!(c==='*'||el.dataset.cat===c)});
+}));
+"""
 
-### 1.4 สร้างห้อง + สิทธิ์
-| ห้อง | Variable | @everyone | role บอทต้องมี |
-|---|---|---|---|
-| ห้องสรุป ticket (แอดมินเท่านั้น) | `TICKET_BOARD_CHANNEL_ID` | ❌ ไม่เห็น | View · Send · Embed Links · Read History |
-| ห้องแอดมินรับสรุปรายวัน | `ADMIN_ALERT_CHANNEL_ID` (ว่าง = mod-logs) | ❌ | เหมือนบน |
-| newbie-cookies | `NEWBIE_CHANNEL_ID` | ✅ เห็น | View · Send · Embed Links |
-| วิธีเข้าเซิฟ (ห้องที่มีปุ่ม Join) | `JOIN_CHANNEL_ID` | ✅ | — (ใช้ทำลิงก์) |
-| server-info | `CONNECT_INFO_CHANNEL_ID` | ตามเดิม (เห็นเมื่อมี role คุกกี้) | — |
-| 🎡 วงล้อรายวัน | `SPIN_CHANNEL_ID` | View · Read History · ❌ Send Messages | View · Send · Embed · Read History · **Create Private Threads** · **Manage Threads** · Send in Threads |
-| 🛍️ ร้านแลกของ | `REDEEM_CHANNEL_ID` | View · Read History · ❌ Send Messages | View · Send · Embed Links |
-| log แลกของ (แอดมิน) | `REDEEM_LOG_CHANNEL_ID` (ว่าง = donate-log) | ❌ | View · Send · Embed |
-| ห้องลับ Cookie Express relay | `CKX_CHANNEL_ID` | ❌ | View · Send · Read History |
+STATE_TEXT = {"soon": "เร็วๆ นี้", "ended": "หมดเวลา", "soldout": "หมดแล้ว", "hot": "ใกล้หมดเวลา"}
 
-- กระเป๋าคุกกี้ของแต่ละคนเป็น **private thread ในห้องวงล้อ** (หรือแยกห้องด้วย `WALLET_CHANNEL_ID`) — ทีมแอดมินต้องมี **Manage Threads** ในห้องนั้นถึงจะเห็นกระเป๋าทุกคน
-- ห้องวงล้อ: @everyone ต้องเห็นห้อง (View + Read History) ไม่งั้นเปิดกระเป๋าตัวเองไม่ได้ · ปิด Send Messages ในห้องหลักได้
 
-### 1.5 ต่อกับ Cookie Express relay
-1. คลิกขวาบอทนี้ → Copy User ID → ใส่ใน `allowed_user_ids` ของ `relay_config.json` บนเครื่องเซิฟ แล้วปิดเปิด relay
-2. คลิกขวาบอท relay → Copy User ID → ใส่ `CKX_RELAY_BOT_ID` (บอทจะเชื่อเฉพาะข้อความจาก relay)
-3. ห้อง `CKX_CHANNEL_ID` = ห้องเดียวกับที่ relay อ่าน (`channel_id` ใน relay_config.json)
+def render_page(items: list, meta: dict) -> str:
+    """items: dict (code name description price category image_url limit stock start end state)"""
+    e = html.escape
+    cats = sorted({i["category"] for i in items if i.get("category")})
+    nav = ""
+    if cats:
+        nav = "<nav aria-label='หมวด'><button data-cat='*' aria-pressed='true'>ทั้งหมด</button>" + "".join(
+            f"<button data-cat='{e(c)}' aria-pressed='false'>{e(c)}</button>" for c in cats) + "</nav>"
+    cards = []
+    for i in items:
+        state = i.get("state") or "open"
+        pic = (f"<img src='{e(i['image_url'])}' alt='{e(i['name'])}' loading='lazy'>" if i.get("image_url")
+               else "<div class='ph' aria-hidden='true'>🍪</div>")
+        badge = f"<span class='state {state}'>{STATE_TEXT[state]}</span>" if state in STATE_TEXT else ""
+        chips = []
+        if i.get("limit"):
+            chips.append(f"แลกได้ {i['limit']} ครั้ง/คน")
+        if i.get("stock") is not None and i["stock"] >= 0:
+            chips.append(f"เหลือ {i['stock']} ชิ้น")
+        if i.get("start") and state == "soon":
+            chips.append(f"เริ่ม {thai_date(i['start'])}")
+        if i.get("end") and state in ("open", "hot"):
+            chips.append(f"ถึง {thai_date(i['end'])}")
+        meta_html = "".join(f"<span>{e(c)}</span>" for c in chips)
+        cat = f"<span class='cat'>{e(i['category'])}</span>" if i.get("category") else ""
+        desc = f"<p class='desc'>{e(i['description'])}</p>" if i.get("description") else ""
+        off = " off" if state in ("ended", "soldout") else ""
+        cards.append(
+            f"<article class='item{off}' data-cat='{e(i.get('category') or '')}'>"
+            f"<div class='pic'>{pic}{badge}</div>"
+            f"<div class='body'>{cat}<h2>{e(i['name'])}</h2>{desc}<div class='meta'>{meta_html}</div></div>"
+            f"<div class='price'><b>{i['price']:,} 🍪</b><small>รหัส {e(i['code'])}</small></div></article>")
+    if not cards:
+        cards.append("<p class='empty'>ยังไม่มีของในร้าน รอแอดมินเติมของก่อนนะ 🍪</p>")
+    cta = (f"<a class='cta' href='{e(meta['redeem_url'])}'>🛍️ ไปแลกใน Discord</a>" if meta.get("redeem_url") else "")
+    title = e(meta.get("title") or "Cookie Shop")
+    return (
+        "<!doctype html><html lang='th'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{title}</title>"
+        "<link rel='preconnect' href='https://fonts.googleapis.com'>"
+        "<link href='https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;600&family=Mitr:wght@500;600"
+        "&display=swap' rel='stylesheet'>"
+        f"<style>{CSS}</style></head><body>"
+        f"<header><h1>{title} <span>🍪</span></h1>"
+        f"<p class='sub'>{e(meta.get('subtitle') or '')}</p>{cta}</header>"
+        f"{nav}<main>{''.join(cards)}</main>"
+        f"<footer>{e(meta.get('footer') or '')}</footer>"
+        f"<script>{JS}</script></body></html>")
 
-### 1.6 ตั้งค่าครั้งแรกใน Discord (ทำตามลำดับ)
-```
-/setting joininfo                          ← วางข้อความวิธีเข้าเซิฟ (Radmin + IP + ลิงก์ม็อด) ที่จะแปะตอนอนุมัติ WL
-/spin add label:คุกกี้ชิ้นเล็ก cookies:10 weight:60
-/spin add label:คุกกี้ชิ้นกลาง cookies:30 weight:30
-/spin add label:กล่องคุกกี้ cookies:100 weight:9
-/spin add label:แจ็กพอต cookies:500 weight:1   ← /spin list ดู % และค่าเฉลี่ยต่อเดือน
-/setting cookie_rate cookies_per_baht:10     ← เติมตามยอด 1 บาท = 10 คุกกี้ (0 = ปิด)
-/item add code:CK100 name:แพ็กคุกกี้ 1,200 price:100 cookies:1200   ← แพ็กคุกกี้ (ไม่บังคับ)
-/shop add code:KEY name:Cookie Master Key price:800 ckx:CX-BKSP-KTPN limit:1 image:<แนบรูป>
-/panel kind:spin channel:#วงล้อ
-/panel kind:shop channel:#ร้านแลกของ
-/board                                      ← สร้างการ์ดสรุป ticket
-/check                                      ← ต้องไม่มี ❌
-```
 
----
+def create_app(get_page, images_dir: Path) -> web.Application:
+    """get_page() → (items, meta)"""
+    images_dir = Path(images_dir)
 
-## 2. ตั้งค่าพื้นฐาน (ถ้าตั้งบอทใหม่ทั้งหมด)
+    async def index(request):
+        items, meta = get_page()
+        return web.Response(text=render_page(items, meta), content_type="text/html", charset="utf-8",
+                            headers={"Cache-Control": "no-cache"})
 
-### 2.1 Variables ที่ต้องมี
-| Variable | ใส่อะไร |
-|---|---|
-| `DISCORD_TOKEN` | token บอท |
-| `GUILD_ID` | ID เซิฟ Discord |
-| `ROLE_SURVIVOR` | role ที่ได้หลังผ่าน White List (role **คุกกี้**) |
-| `ROLE_STAFF` | role ทีมแอดมิน (หลายอันคั่นด้วย `,`) |
-| `TICKET_CHANNEL_ID` | ห้อง ticket ห้องเดียว |
-| `TRANSCRIPT_CHANNEL_ID` | ห้องเก็บบทสนทนาตอนปิด ticket |
-| `STRIPE_SECRET_KEY` | ใส่เมื่อพร้อมเปิด Donate |
+    async def image(request):
+        name = request.match_info["name"]
+        if not IMAGE_RE.match(name):
+            raise web.HTTPNotFound()
+        path = images_dir / name
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
 
-ID หาได้จาก: Discord → User Settings → Advanced → เปิด **Developer Mode** → คลิกขวาที่ห้อง/role/คน → **Copy ID**
+    async def health(request):
+        return web.Response(text="ok")
 
-### 2.2 ห้อง ticket
-| ใคร | ✅ อนุญาต | ❌ ปิด |
-|---|---|---|
-| @everyone | View Channel · Send Messages in Threads · Read Message History | Send Messages · Create Public Threads · Create Private Threads |
-| role ทีมแอดมิน | View Channel · Send Messages in Threads · **Manage Threads** · Read Message History | |
-| role บอท | View · Send · Send in Threads · **Create Private Threads** · **Manage Threads** · Embed Links · Attach Files · Read History | |
-
-ใส่ role ทีม (`ROLE_STAFF`) ให้ตัวเองด้วย บอทดึงทุกคนที่มี role นี้เข้า ticket และแท็กเป็นรายคน · ลาก role บอทให้อยู่**เหนือ** role คุกกี้
-
-### 2.3 Stripe
-1. บัญชี Stripe ประเทศไทย → Settings → Payments → Payment methods → เปิด **PromptPay**
-2. Developers → API keys → ก๊อป Secret key (`sk_test_` ตอนทดสอบ, `sk_live_` ใช้จริง) → ใส่ `STRIPE_SECRET_KEY`
-3. ไม่ต้องตั้ง Webhook — บอทเช็คบิลเองทุก ~20 วินาที
-
----
-
-## 3. คำสั่ง
-
-### แอดมิน (Manage Server)
-| คำสั่ง | ทำอะไร |
-|---|---|
-| `/panel kind:welcome / ticket / donate / spin / shop` | ส่งป้ายลงห้อง (ป้ายวงล้อ/ร้านอัปเดตเองเมื่อแก้รางวัล/อัตรา) |
-| `/setting joininfo` | ข้อความวิธีเข้าเซิฟ (`{server_info}` `{collection}` = ลิงก์ห้อง/คอลเลกชันม็อด) |
-| `/setting remind_text` | ข้อความการ์ดเตือนขอ White List (`{join}` = ลิงก์ห้องวิธีเข้าเซิฟ) |
-| `/setting cookie_rate` · `/setting show` | อัตราเติมคุกกี้ · ดูค่าที่ตั้งไว้ |
-| `/spin add / edit / remove / list / reset` | รางวัลวงล้อ (น้ำหนักมาก = ออกบ่อย) · `reset member:` ให้หมุนวันนี้ได้อีก |
-| `/shop add / edit / remove / list` | ของในร้านคุกกี้ (ดูข้อ 4.4) |
-| `/cookies give / take / balance` | ให้/หัก/ดูคุกกี้ของผู้เล่น |
-| `/item add / edit / remove / list` | รายการ Donate (เพิ่มช่อง `cookies:` = แพ็กคุกกี้ · `ckx:` = รหัสของในเกม ส่งเองหลังจ่าย) |
-| `/check` | ตรวจสิทธิ์ทุกห้อง + intent + Steam + Stripe + faq.json + โดเมนเว็บ |
-| `/remind` · `/board` | สรุปคนยังไม่ขอ WL ตอนนี้ · อัปเดตห้องสรุป ticket ทันที |
-
-### ทีมแอดมิน (Manage Threads)
-```
-/order list · /order deliver order_id:12 · /order check order_id:12
-/redeem list problem_only:True · /redeem action redeem_id:15 action:คืนคุกกี้(แอดมิน)|ส่งเข้าเกมอีกครั้ง|บันทึกว่าส่งให้แล้ว
-/ticket add · /ticket remove · /ticket close · /whitelist remove · /whitelist info · /steam info|lookup|unlink
-```
-
----
-
-## 4. Flow
-
-### 4.1 ขอ White List
-1. 🍪 Join → 📝 ขอ White List → กรอก Steam · **ชื่อในเกมที่จะตั้ง** · ช่วงเวลาออน · รู้จักจากไหน · รหัสลับ
-2. แอดมินกด ✅ อนุมัติ → ยืนยัน → บอทให้ role **คุกกี้** + แปะ **วิธีเข้าเซิฟ** (จาก `/setting joininfo`) + ปุ่ม **ไปห้อง Server info** ในห้อง ticket และ DM → ปิด ticket
-3. ผู้เล่นตั้ง Username / Password เองตอนเข้าเซิฟครั้งแรก · ชื่อที่กรอกไว้กลายเป็น **ชื่อรับของในเกม** (แก้เองได้ในกระเป๋า)
-
-### 4.2 แจ้งบั๊ก / ติดต่อแอดมิน (บอทถามตอบก่อน)
-- เปิดห้องทันที ไม่มีฟอร์ม → บอทโชว์เมนูจาก `faq.json` → ผู้เล่นกดปุ่ม **หรือพิมพ์เลข** → คำตอบ + "ติดขั้นไหนกดเลขนั้น" → ลึกลงไปเรื่อยๆ
-- ทุกหน้ามีปุ่ม **คุยกับแอดมิน** (หรือพิมพ์ `0`) → บอทดึงทีมแอดมินเข้าห้อง + แท็ก + สรุปว่าผู้เล่นลองอะไรไปแล้ว
-- ระหว่างคุยกับบอท แอดมิน**ไม่ถูกดึง/ไม่ถูกแท็ก** ห้องสรุปขึ้น 🤖
-- **จบกับบอท** (กด "แก้ได้แล้ว" หรือ 🔒 ปิดห้อง) → ลบห้องทันที ไม่เก็บ transcript (mod-logs จด 1 บรรทัดว่าแก้ได้ด้วยข้อไหน)
-- **โหมดคุยกับแอดมิน** → ปุ่มปิดให้เลือก 🔒 ปิดเก็บไว้ / ⛔ ปิดและลบ (ผู้เล่นหรือแอดมินกดได้)
-- ติดต่อแอดมิน → ถามก่อนว่าเรื่องนี้ตรงกับหัวข้อในเมนูไหม ไม่ตรงค่อยเรียกแอดมิน
-- เปิดใหม่ได้เลขใหม่ทุกครั้ง (bug-0001, bug-0002 …)
-
-### 4.3 วงล้อ + กระเป๋า
-- ห้องวงล้อ → 🎡 **หมุนเลย** วันละครั้ง (รีเซ็ตเที่ยงคืน) → ผลเห็นคนเดียว หายเองใน 5 นาที (`SPIN_RESULT_SECONDS`)
-- หมุนครั้งแรก → บอทสร้าง **กระเป๋า** = private thread `🍪 ชื่อ` (อยู่ถาวร): ยอดคุกกี้ · วันนี้หมุนได้อะไร · ชื่อในเกม · ประวัติ · ใบแลกของ + ปุ่ม 🛒 เปิดร้าน / 🎮 ชื่อในเกม
-- แอดมินเห็นกระเป๋าทุกคน (Manage Threads) แต่บอทไม่แท็กแอดมินในกระเป๋า
-
-### 4.4 ร้านแลกของ
-- ห้องร้าน → 🛒 **เปิดร้าน** → หน้าร้านเห็นคนเดียว: รูป · ชื่อ · คำอธิบาย · ราคา · จำกัดต่อคน · สต็อก · ช่วงเวลา · แยกหมวด · หน้าละ 4 ชิ้น
-- ปุ่มแลกบอกเองว่า "ขาดอีก X 🍪" / "หมดแล้ว" / "ยังไม่เปิด" · ของที่หมดเวลาซ่อนเอง
-- แลก → ใส่ชื่อในเกม (+ จำนวน) → หักคุกกี้ → **ใบแลก RD-0001** ในกระเป๋า + log แอดมิน → บอทโพสต์คำสั่งให้ Cookie Express relay → ของขึ้นในเกม (จอแก้ว)
-- สถานะในใบแลกเปลี่ยนเอง: ⏳ ส่งคำสั่งแล้ว → 📦 อยู่ในคิว → 👀 ขึ้นในเกมแล้ว → ✅ รับในเกมแล้ว
-- **คืนคุกกี้อัตโนมัติ**: relay ปฏิเสธทั้งคำสั่ง หรือออเดอร์ถูกยกเลิกก่อนรับ · **รอแอดมิน**: เซิฟบอกว่ารหัสใช้ไม่ได้/ส่งไม่ครบ (⚠️ + ปุ่มคืนคุกกี้/ส่งใหม่ใน log)
-- ปุ่ม **คืนคุกกี้** กดได้เฉพาะแอดมิน และเฉพาะใบที่ผู้เล่นยังไม่ได้รับของ — บอทยกเลิกออเดอร์ใน relay ก่อนแล้วค่อยคืน · ถ้าผู้เล่นกดรับในเกมพอดีหลังคืน บอทแท็กแอดมินให้ดู
-- ของที่ไม่มีรหัส Cookie Express (เช่น ยศ Discord) → 🙋 แท็กแอดมิน → กด 📦 ส่งให้แล้ว
-- **หน้าเว็บแคตตาล็อก**: `https://<โดเมน Railway>/` ดูรูปใหญ่/รายละเอียด มีปุ่มกลับไปแลกใน Discord (แลกบนเว็บไม่ได้ — ไม่ต้องทำระบบล็อกอิน)
-
-`/shop add` ช่องที่ใช้บ่อย: `ckx:` รหัส CX-/CV- (หลายชิ้น `CX-AAAA-BBBB*2 CV-CCCC-DDDD`) · `limit:` ต่อคน (0 = ไม่จำกัด) · `stock:` ทั้งหมด (-1 = ไม่จำกัด) · `start:` / `end:` เช่น `31/10/2026 23:59` (ปี พ.ศ. ได้) · `image:` แนบรูป · `category:` หมวด · `/shop edit` ใส่ `-` เพื่อลบช่องข้อความ
-
-### 4.5 Donate → คุกกี้ / ของในเกม
-- ห้อง Donate มีปุ่ม 🍪 **เติมคุกกี้** (ตามอัตรา `/setting cookie_rate`) + แพ็กคุกกี้จาก `/item` ใส่ตะกร้าปนกับของอื่นได้
-- รายการที่มี `ckx:` → ตอนยืนยันบอทถามชื่อในเกม (ถ้ายังไม่รู้) → จ่ายแล้วส่งเข้าเกมเอง
-- จ่ายแล้ว: คุกกี้เข้ากระเป๋าทันที · ของ ckx เข้าคิวในเกม (การ์ดโชว์สถานะ 📦 → 👀 → ✅) · ไม่มีรายการส่งมือ → พอผู้เล่นกดรับในเกม บอทปิดออเดอร์เป็น "ส่งแล้ว" เอง ไม่แท็กแอดมิน · มีรายการส่งมือ หรือส่งเข้าเกมไม่สำเร็จ → แท็กแอดมิน + ปุ่ม 📦
-- บอทรีสตาร์ทกลางทาง (จ่ายแล้วแต่ยังไม่ได้เติม/ส่ง) → ทำต่อให้เองตอนเปิด
-
-### 4.6 ห้องสรุป ticket (แอดมิน)
-- การ์ดละ 1 ประเภท (White List · Donate · แจ้งบั๊ก · รีพอร์ต · ติดต่อแอดมิน · แลกของ) **แก้ในข้อความเดิม** ไม่ส่งใหม่
-- เรียงจากด่วนสุด: 💝 จ่ายแล้วรอส่งของ · 🔴 ยังไม่มีแอดมินตอบ · 🟡 ผู้เล่นตอบล่าสุด · 🟢 ตอบแล้วรอผู้เล่น · 💳 รอจ่าย · 🛒 กำลังเลือก · 🤖 คุยกับบอท · ⚫ ปิดใน 24 ชม.
-- กดเลข ticket = กระโดดไปห้องนั้น · มีเวลาเปิด + เวลาข้อความล่าสุด
-- Discord ไม่บอกบอทว่าใคร "อ่าน" แล้ว — สถานะนับจาก **ใครพิมพ์ล่าสุด** (แอดมิน = คนที่มี role ทีม)
-
-### 4.7 เตือนคนที่ยังไม่ขอ White List
-- ทุกวัน 20:00 (`WL_REMIND_HOUR`) บอทสรุปในห้องแอดมิน: คนที่**ไม่มี role อะไรเลย** + เข้าดิสมาเกิน 3 วัน + ไม่เคยเปิด ticket ขอ WL
-- ปุ่ม 📣 **ส่งเตือนใน newbie** → การ์ดเดียวแท็กรวมทุกคน + ปุ่มไปห้องวิธีเข้าเซิฟ · 📝 แก้ข้อความ · ⏩ ข้าม
-- คนเดิมโดนแท็กซ้ำได้ทุก 3 วัน (`WL_REMIND_REPEAT_DAYS`) · ไม่มีใครค้าง = ไม่ส่งการ์ด
-
----
-
-## 5. แก้คำถามตอบของบอท (`faq.json`)
-```json
-"connect": {
-  "title": "เข้าเซิฟไม่ได้",
-  "text": "ข้อความคำตอบ (markdown ได้)",
-  "images": ["radmin_join.png"],
-  "ask": "ติดขั้นไหนกดเลขนั้นได้เลยค่ะ",
-  "options": [
-    {"n": 9, "label": "เข้าได้แล้ว", "go": "@solved"},
-    {"n": 1, "label": "หาไอคอนไม่เจอ", "go": "connect_icon"},
-    {"n": 0, "label": "คุยกับแอดมิน", "go": "@admin"}
-  ]
-}
-```
-- `go`: ชื่อข้ออื่น · `@solved` แก้ได้แล้ว · `@admin` เรียกแอดมิน · `@menu` เมนูแรก
-- `{server_info}` `{collection}` `{join}` `{spin}` `{redeem}` บอทแทนเป็นลิงก์ให้เอง
-- รูปวางใน `assets/faq/` · แก้แล้ว push → `/check` ต้องขึ้น `✅ faq.json N ข้อ` (ถ้าไฟล์ผิด บอทบอกบรรทัดที่ผิด และ ticket จะส่งตรงถึงแอดมินแทน)
-
----
-
-## 6. ปัญหาที่เจอบ่อย
-| อาการ | แก้ |
-|---|---|
-| บอท restart วน | Deploy Logs บอกว่า Variable ไหนผิด · `ต้องเปิด SERVER MEMBERS INTENT…` = ข้อ 1.2 |
-| แอดมินไม่เห็น ticket / กระเป๋า | ใส่ role ทีมให้ตัวเอง + role ทีมต้องมี **Manage Threads** ในห้องนั้น |
-| กดหมุนแล้วไม่ได้กระเป๋า | `/check` ดูห้องวงล้อ: บอทต้อง Create Private Threads + Manage Threads · @everyone ต้อง View + Read History |
-| ใบแลกค้าง "⏳ ส่งคำสั่งแล้ว" | relay ไม่ได้รัน หรือไม่ได้ใส่ ID บอทนี้ใน `allowed_user_ids` (relay ตอบ 🚫) — เปิด relay แล้วจะทำต่อเอง |
-| ใบแลกค้าง "⏳ รอส่งคำสั่ง" | บอทส่งเข้าห้อง relay ไม่ได้ — `/check` ดู `CKX_CHANNEL_ID` (บอทลองใหม่ทุกนาที) |
-| ของในร้านไม่มีรูป | ยังไม่ได้ Generate Domain (ข้อ 1.3) |
-| ห้องสรุปไม่ขยับ | `/board` · การ์ดถูกลบ = บอทส่งใหม่ให้ |
-| สรุปรายวันไม่มา | ไม่มีใครเข้าเงื่อนไข (ลอง `/remind`) หรือ `/check` ห้องแอดมิน |
-
-## 7. ข้อควรรู้
-- คุกกี้ทุกการเปลี่ยนแปลงมีบันทึก (`/cookies balance`) · เติมจาก Donate ครั้งเดียวต่อออเดอร์ แม้บอทเช็คบิลซ้ำ
-- relay ใช้ id ข้อความเป็นเลขออเดอร์ → บอทกันโพสต์คำสั่งซ้ำ · relay ปิดอยู่ ออเดอร์ไม่หาย ทำต่อเมื่อเปิด · บอทปิดอยู่ (Railway deploy) ตอน relay ตอบ → เปิดมาบอทอ่านย้อนหลังให้
-- คืนเงิน Donate ทำใน Stripe Dashboard · คืนคุกกี้ใช้ปุ่มใน log หรือ `/redeem action`
-- ลบกระเป๋า (thread) ทิ้งได้ ยอดคุกกี้ไม่หาย สร้างใหม่ตอนใช้ครั้งหน้า
-
-### รันในเครื่อง (ทดสอบ)
-```bash
-pip install -r requirements.txt
-cp .env.example .env      # ใส่ค่า
-python bot.py             # หน้าเว็บที่ http://localhost:8080
-```
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_get("/img/{name}", image)
+    app.router.add_get("/health", health)
+    return app
