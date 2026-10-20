@@ -261,6 +261,9 @@ class Config:
     public_url: str = ""
     web_enabled: bool = True
     web_port: int = 8080
+    discord_client_id: str = ""      # ว่าง = ใช้ Application ID ของบอทนี้
+    discord_client_secret: str = ""  # มีค่า = เปิดล็อกอินด้วย Discord + แลกของบนเว็บ
+    invite_url: str = ""             # ลิงก์เชิญเข้าดิส (โชว์บนเว็บถ้าคนล็อกอินไม่ได้อยู่ในเซิฟ)
     auto_close_after_decision: bool = True
     utc_offset: int = 7
     accent_color: int = 0x22C7E8
@@ -395,6 +398,9 @@ def load_config(env: Mapping[str, str]) -> Config:
                                                  if _str(env, "RAILWAY_PUBLIC_DOMAIN") else "")).rstrip("/"),
         web_enabled=_bool(env, "WEB_ENABLED", True),
         web_port=_int(env, "PORT", 8080),
+        discord_client_id=_str(env, "DISCORD_CLIENT_ID"),
+        discord_client_secret=_str(env, "DISCORD_CLIENT_SECRET"),
+        invite_url=_str(env, "DISCORD_INVITE_URL"),
         auto_close_after_decision=_bool(env, "AUTO_CLOSE_AFTER_DECISION", True),
         utc_offset=_int(env, "UTC_OFFSET", 7),
         accent_color=_color(env, "ACCENT_COLOR", 0x22C7E8),
@@ -590,6 +596,16 @@ class Database:
                 last_at TEXT
             );
             CREATE TABLE IF NOT EXISTS relay_seen(msg_id INTEGER PRIMARY KEY, at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS carts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id INTEGER NOT NULL,
+                nonce TEXT NOT NULL,
+                total INTEGER NOT NULL DEFAULT 0,
+                ingame TEXT NOT NULL DEFAULT '',
+                receipt_id INTEGER,
+                created_at TEXT NOT NULL,
+                UNIQUE(discord_id, nonce)
+            );
             CREATE TABLE IF NOT EXISTS remind_batches(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_ids TEXT NOT NULL,
@@ -613,11 +629,13 @@ class Database:
                 ("items", "ckx TEXT NOT NULL DEFAULT ''"),
                 ("orders", "ingame TEXT NOT NULL DEFAULT ''"),
                 ("orders", "job_id INTEGER"),
-                ("orders", "cookies_given INTEGER NOT NULL DEFAULT 0")):
+                ("orders", "cookies_given INTEGER NOT NULL DEFAULT 0"),
+                ("redemptions", "cart_id INTEGER")):
             try:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
             except sqlite3.OperationalError:
                 pass
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_redeem_cart ON redemptions(cart_id)")
         self.conn.commit()
 
     @staticmethod
@@ -956,39 +974,101 @@ class Database:
     def redeem(self, discord_id, code, qty, ingame, now: datetime):
         """หักคุกกี้ + จองของ + สร้างใบแลก ในทีเดียว — คืน (redemption_id, None) หรือ (None, เหตุผล)"""
         try:
-            return self._redeem(discord_id, code, qty, ingame, now)
+            with self.conn:
+                return self._redeem_line(discord_id, code, qty, ingame, now), None
         except _Rollback as e:
-            return None, ("คุกกี้ไม่พอ" if str(e) == "poor" else "แลกซ้ำ ลองใหม่อีกครั้ง")
+            return None, str(e)
 
-    def _redeem(self, discord_id, code, qty, ingame, now: datetime):
+    def _redeem_line(self, discord_id, code, qty, ingame, now: datetime, cart_id=None, prefix="") -> int:
+        """ใช้ใน with self.conn: — ผิดเงื่อนไขโยน _Rollback(เหตุผล) ให้ยกเลิกทั้ง transaction"""
+        item = self.shop_get(code)
+        problem = shop_problem(item, now)
+        if problem:
+            raise _Rollback(prefix + problem)
+        if qty < 1:
+            raise _Rollback(prefix + "จำนวนต้องมากกว่า 0")
+        if item["per_user_limit"]:
+            left = item["per_user_limit"] - self.redeemed_qty(discord_id, item["code"])
+            if left <= 0:
+                raise _Rollback(f"แลก {item['name']} ครบ {item['per_user_limit']} ครั้งแล้ว")
+            if qty > left:
+                raise _Rollback(prefix + f"แลกได้อีกแค่ {left} ชิ้น")
+        if item["stock"] >= 0 and qty > item["stock"]:
+            raise _Rollback(prefix + ("ของหมดแล้ว" if item["stock"] == 0 else f"เหลือแค่ {item['stock']} ชิ้น"))
+        cost = item["price"] * qty
+        now_iso = now.isoformat()
+        cur = self.conn.execute(
+            "INSERT INTO redemptions(discord_id, code, name, price, qty, ckx, ingame, status, cart_id, created_at, "
+            "updated_at) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)",
+            (discord_id, item["code"], item["name"], item["price"], qty, item["ckx"], ingame, cart_id, now_iso,
+             now_iso))
+        rid = cur.lastrowid
+        ok, why = self._cookies(discord_id, -cost, "redeem", ref=f"rd-{rid}", note=f"{item['name']} × {qty}")
+        if not ok:
+            raise _Rollback("คุกกี้ไม่พอ" if why == "poor" else "แลกซ้ำ ลองใหม่อีกครั้ง")
+        if item["stock"] >= 0:
+            self.conn.execute("UPDATE shop_items SET stock=stock-? WHERE code=?", (qty, item["code"]))
+        return rid
+
+    # --- ตะกร้า (แลกหลายชิ้นจากหน้าเว็บ) ---
+    def redeem_cart(self, discord_id, lines, ingame, now: datetime, nonce: str, ckx_items: dict = None):
+        """แลกทั้งตะกร้าใน transaction เดียว: ผ่านทุกชิ้นหรือไม่ได้สักชิ้น
+        (หักคุกกี้ + ตัดสต็อก + ใบแลก + งานส่งเข้าเกม + ชื่อในเกม — commit พร้อมกันหมด)
+        lines = [(code, qty)] · ckx_items = {code: รหัสที่คูณจำนวนแล้ว}
+        → (cart_id, [redemption_id], None) หรือ (None, None, เหตุผล)"""
+        ckx_items = ckx_items or {}
+        try:
+            with self.conn:
+                now_iso = now.isoformat()
+                cart_id = self.conn.execute(
+                    "INSERT INTO carts(discord_id, nonce, ingame, created_at) VALUES(?,?,?,?)",
+                    (discord_id, nonce, ingame, now_iso)).lastrowid
+                rids, total = [], 0
+                for code, qty in lines:
+                    item = self.shop_get(code)
+                    prefix = f"{item['name']}: " if item else f"{code}: "
+                    rid = self._redeem_line(discord_id, code, qty, ingame, now, cart_id=cart_id, prefix=prefix)
+                    rids.append(rid)
+                    total += item["price"] * qty
+                    items = ckx_items.get(code)
+                    if items:
+                        job_id = self.conn.execute(
+                            "INSERT INTO ckx_jobs(kind, ref_id, discord_id, ingame, items, lines_total, created_at, "
+                            "updated_at) VALUES('redeem',?,?,?,?,?,?,?)",
+                            (rid, discord_id, ingame, items, ckx_link.count_lines(items), now_iso, now_iso)).lastrowid
+                        self.conn.execute("UPDATE redemptions SET job_id=?, status='posting' WHERE id=?", (job_id, rid))
+                    else:
+                        self.conn.execute("UPDATE redemptions SET status='manual' WHERE id=?", (rid,))
+                self.conn.execute("UPDATE carts SET total=? WHERE id=?", (total, cart_id))
+                if ingame:
+                    self.conn.execute("UPDATE wallets SET ingame=?, updated_at=? WHERE discord_id=?",
+                                      (ingame, now_iso, discord_id))
+                return cart_id, rids, None
+        except _Rollback as e:
+            return None, None, str(e)
+        except sqlite3.IntegrityError:
+            return None, None, "dup"
+
+    def cart_get(self, cart_id):
+        return self.conn.execute("SELECT * FROM carts WHERE id=?", (cart_id,)).fetchone()
+
+    def cart_by_nonce(self, discord_id, nonce):
+        return self.conn.execute("SELECT * FROM carts WHERE discord_id=? AND nonce=?", (discord_id, nonce)).fetchone()
+
+    def cart_lines(self, cart_id):
+        return self.conn.execute("SELECT * FROM redemptions WHERE cart_id=? ORDER BY id", (cart_id,)).fetchall()
+
+    def carts_unfinished(self, days=7):
+        """ตะกร้าที่ยังโพสต์ใน Discord ไม่ครบ (บอทรีสตาร์ทกลางทาง) — ทำต่อตอนเปิดบอท"""
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        return self.conn.execute(
+            "SELECT * FROM carts WHERE created_at >= ? AND (receipt_id IS NULL OR id IN "
+            "(SELECT cart_id FROM redemptions WHERE cart_id IS NOT NULL AND log_id IS NULL)) ORDER BY id",
+            (since,)).fetchall()
+
+    def cart_set_receipt(self, cart_id, receipt_id):
         with self.conn:
-            item = self.shop_get(code)
-            problem = shop_problem(item, now)
-            if problem:
-                return None, problem
-            if qty < 1:
-                return None, "จำนวนต้องมากกว่า 0"
-            if item["per_user_limit"]:
-                left = item["per_user_limit"] - self.redeemed_qty(discord_id, item["code"])
-                if left <= 0:
-                    return None, f"แลก {item['name']} ครบ {item['per_user_limit']} ครั้งแล้ว"
-                if qty > left:
-                    return None, f"แลกได้อีกแค่ {left} ชิ้น"
-            if item["stock"] >= 0 and qty > item["stock"]:
-                return None, "ของหมดแล้ว" if item["stock"] == 0 else f"เหลือแค่ {item['stock']} ชิ้น"
-            cost = item["price"] * qty
-            now_iso = now.isoformat()
-            cur = self.conn.execute(
-                "INSERT INTO redemptions(discord_id, code, name, price, qty, ckx, ingame, status, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,'queued',?,?)",
-                (discord_id, item["code"], item["name"], item["price"], qty, item["ckx"], ingame, now_iso, now_iso))
-            rid = cur.lastrowid
-            ok, why = self._cookies(discord_id, -cost, "redeem", ref=f"rd-{rid}", note=f"{item['name']} × {qty}")
-            if not ok:
-                raise _Rollback("poor" if why == "poor" else why)
-            if item["stock"] >= 0:
-                self.conn.execute("UPDATE shop_items SET stock=stock-? WHERE code=?", (qty, item["code"]))
-            return rid, None
+            self.conn.execute("UPDATE carts SET receipt_id=? WHERE id=?", (receipt_id, cart_id))
 
     def redemption_get(self, rid):
         return self.conn.execute("SELECT * FROM redemptions WHERE id=?", (rid,)).fetchone()
@@ -1647,7 +1727,7 @@ class CookieBot(discord.Client):
         for view in (WelcomeView(), TicketPanelView(), DonatePanelView(), CatalogView(), CartView(),
                      ReviewView(), PaymentView(url="https://stripe.com"), ExpiredView(), DeliverView(),
                      TicketView(whitelist_buttons=True), ClosedView(), SpinPanelView(), ShopPanelView(),
-                     WalletCardView()):
+                     WalletCardView(), ShopOpenRouter()):
             self.add_view(view)
         self.add_dynamic_items(FaqButton, RemindButton, RedeemAdminButton, OrderNameButton)
         guild = discord.Object(id=cfg.guild_id)
@@ -1704,6 +1784,10 @@ class CookieBot(discord.Client):
             log.warning("ยังไม่ได้ต่อ Volume — ข้อมูล ticket/whitelist/Steam/Donate จะหายทุกครั้งที่ deploy")
         if not cfg.donate_enabled:
             log.info("ยังไม่ได้ตั้ง STRIPE_SECRET_KEY — ปิดระบบ Donate ไว้")
+        if not getattr(self, "_panels_refreshed", False):  # ป้ายร้านเก่า → ปุ่มตามโหมดปัจจุบัน (เว็บ/ดิส)
+            self._panels_refreshed = True
+            await update_panel("shop", ShopPanelView)
+            spawn(cart_sweep(), "ตะกร้าค้าง")
 
     async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent):
         ticket = db.by_channel(payload.thread_id)
@@ -4019,8 +4103,11 @@ async def do_spin(interaction: discord.Interaction):
 class WalletCardView(BaseLayout):
     def __init__(self, uid: int = 0):
         super().__init__(timeout=None)
-        shop = ui.Button(label="เปิดร้าน", emoji="🛒", style=discord.ButtonStyle.success, custom_id="cc:shop:open")
-        shop.callback = open_shop
+        if web_shop_on():
+            shop = web_shop_button()
+        else:
+            shop = ui.Button(label="เปิดร้าน", emoji="🛒", style=discord.ButtonStyle.success, custom_id="cc:shop:open")
+            shop.callback = open_shop
         name = ui.Button(label="ชื่อในเกม", emoji="🎮", style=discord.ButtonStyle.secondary, custom_id="cc:wallet:name")
         name.callback = change_name
         buttons = [shop, name]
@@ -4215,22 +4302,36 @@ class ShopView(BaseLayout):
             if problem:
                 return await reply(interaction, f"❌ {problem}")
             w = db.wallet_ensure(interaction.user.id)
-            limit = MAX_REDEEM_QTY
-            if item["per_user_limit"]:
-                limit = min(limit, item["per_user_limit"] - db.redeemed_qty(interaction.user.id, item["code"]))
-            if item["stock"] >= 0:
-                limit = min(limit, item["stock"])
-            if item["ckx"]:  # จำนวนต่อรหัสในคำสั่งเดียวต้องไม่เกิน 999
-                limit = min(limit, ckx_link.MAX_COUNT // max(1, ckx_link.max_count(item["ckx"])))
-            limit = min(limit, w["balance"] // max(1, item["price"]))
+            limit = min(redeem_cap(item, interaction.user.id), w["balance"] // max(1, item["price"]))
             if limit < 1:
                 return await reply(interaction, "แลกชิ้นนี้ไม่ได้แล้ว (ครบสิทธิ์ / ของหมด / คุกกี้ไม่พอ)")
             await interaction.response.send_modal(RedeemModal(item, w["ingame"], limit))
         return cb
 
 
+def web_shop_button(label: str = "เปิดร้าน") -> ui.Button:
+    return ui.Button(label=label, emoji="🛒", url=cfg.public_url + "/")
+
+
 async def open_shop(interaction: discord.Interaction):
+    if web_shop_on():  # ร้านย้ายไปหน้าเว็บ (ปุ่มเก่าในข้อความเดิมยังกดได้)
+        w = db.wallet_ensure(interaction.user.id)
+        view = ui.View()
+        view.add_item(web_shop_button("เปิดร้านบนเว็บ"))
+        return await interaction.response.send_message(
+            f"🛍️ ร้านคุกกี้อยู่บนเว็บแล้ว — ล็อกอินด้วย Discord ใส่ตะกร้าแล้วกดแลกได้เลย\n"
+            f"คุกกี้ของคุณตอนนี้ **{fmt_cookies(w['balance'])}**", view=view, ephemeral=True)
     await interaction.response.send_message(view=ShopView(interaction.user), ephemeral=True)
+
+
+class ShopOpenRouter(BaseLayout):
+    """จับปุ่ม cc:shop:open ในข้อความเก่า (ป้ายร้าน/กระเป๋าที่โพสต์ก่อนเปิดร้านบนเว็บ)"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        btn = ui.Button(label="เปิดร้าน", custom_id="cc:shop:open")
+        btn.callback = open_shop
+        self.add_item(ui.ActionRow(btn))
 
 
 class RedeemModal(BaseModal):
@@ -4393,18 +4494,24 @@ def redeem_admin_view(r) -> Optional[ui.View]:
     return view
 
 
-async def redemption_changed(guild, rid: int, notify_staff: bool = False):
-    """อัปเดตใบแลกในกระเป๋า + log แอดมิน + การ์ดกระเป๋า + ห้องสรุป"""
+async def redemption_changed(guild, rid: int, notify_staff: bool = False, cart_receipt: bool = True):
+    """อัปเดตใบแลกในกระเป๋า + log แอดมิน + การ์ดกระเป๋า + ห้องสรุป
+    ใบที่มาจากตะกร้าเว็บ → อัปเดตใบแลกรวมของตะกร้าแทนใบเดี่ยว"""
     if guild is None:
         return
     r = db.redemption_get(rid)
     embed = receipt_embed(r)
-    member = guild.get_member(r["discord_id"])
     thread = None
-    try:
-        thread = await ensure_wallet(guild, member or discord.Object(id=r["discord_id"]), create=member is not None)
-    except discord.HTTPException as e:
-        log.warning("กระเป๋าของ %s: %s", r["discord_id"], e)
+    if r["cart_id"]:
+        if cart_receipt:
+            await cart_receipt_update(guild, r["cart_id"])
+    else:
+        member = guild.get_member(r["discord_id"])
+        try:
+            thread = await ensure_wallet(guild, member or discord.Object(id=r["discord_id"]),
+                                         create=member is not None)
+        except discord.HTTPException as e:
+            log.warning("กระเป๋าของ %s: %s", r["discord_id"], e)
     if thread is not None:
         try:
             if r["receipt_id"]:
@@ -4417,7 +4524,7 @@ async def redemption_changed(guild, rid: int, notify_staff: bool = False):
     log_channel = cfg.redeem_log or cfg.donate_log or cfg.mod_logs
     view = redeem_admin_view(r)
     log_embed = receipt_embed(r)
-    log_embed.description = f"<@{r['discord_id']}>"
+    log_embed.description = f"<@{r['discord_id']}>" + (f" · 🛒 ตะกร้าเว็บ C-{r['cart_id']:04d}" if r["cart_id"] else "")
     try:
         if r["log_id"] and guild.get_channel(log_channel):
             await guild.get_channel(log_channel).get_partial_message(r["log_id"]).edit(embed=log_embed, view=view)
@@ -4629,15 +4736,18 @@ async def ckx_retry_loop():
 class ShopPanelView(BaseLayout):
     def __init__(self):
         super().__init__(timeout=None)
-        shop = ui.Button(label="เปิดร้าน", emoji="🛒", style=discord.ButtonStyle.success, custom_id="cc:shop:open")
-        shop.callback = open_shop
+        if web_shop_on():
+            shop = web_shop_button()
+        else:
+            shop = ui.Button(label="เปิดร้าน", emoji="🛒", style=discord.ButtonStyle.success, custom_id="cc:shop:open")
+            shop.callback = open_shop
         wallet = ui.Button(label="กระเป๋าของฉัน", emoji="👛", style=discord.ButtonStyle.secondary,
                            custom_id="cc:wallet:open")
         wallet.callback = open_wallet
         topup = ui.Button(label="เติมคุกกี้", emoji="💝", style=discord.ButtonStyle.secondary, custom_id="cc:shop:topup")
         topup.callback = start_donate_ticket
         row = [shop, wallet] + ([topup] if cfg.donate_enabled else [])
-        if cfg.public_url and cfg.web_enabled:
+        if cfg.public_url and cfg.web_enabled and not web_shop_on():
             row.append(ui.Button(label="แคตตาล็อก", emoji="🌐", url=cfg.public_url + "/"))
         rate = int(db.setting("cookie_rate", "0") or 0)
         ways = [f"🎡 หมุนวงล้อรายวันที่ {fill_placeholders('{spin}')}"]
@@ -4653,6 +4763,12 @@ class ShopPanelView(BaseLayout):
             accent_colour=COLOR_DONATE))
 
 
+def web_shop_on() -> bool:
+    """ล็อกอิน Discord + แลกของบนเว็บ (ต้องมีโดเมน https และ DISCORD_CLIENT_SECRET)"""
+    secure = cfg.public_url.startswith("https://") or cfg.public_url.startswith("http://localhost")
+    return bool(cfg.web_enabled and secure and cfg.discord_client_secret)
+
+
 def web_page_data():
     now = datetime.now(timezone.utc)
     items = []
@@ -4662,7 +4778,7 @@ def web_page_data():
             continue
         items.append({
             "code": i["code"], "name": i["name"], "description": i["description"], "price": i["price"],
-            "category": i["category"], "limit": i["per_user_limit"],
+            "category": i["category"], "limit": i["per_user_limit"], "ckx": bool(i["ckx"]),
             "stock": i["stock"] if i["stock"] >= 0 else None, "state": state,
             "image_url": f"/img/{i['image']}?v={_ts(i['updated_at']) or 0}" if i["image"] else "",
             "start": datetime.fromisoformat(i["start_at"]).astimezone(TZ) if i["start_at"] else None,
@@ -4670,9 +4786,372 @@ def web_page_data():
         })
     meta = {"title": "Cookie Shop",
             "subtitle": "แลกของในเกมด้วยคุกกี้ 🍪 จากวงล้อรายวันและการ Donate · กดแลกได้ในดิสคอร์ด",
+            "subtitle_login": "ล็อกอินด้วย Discord เพื่อดูคุกกี้ของคุณ แล้วเลือกของใส่ตะกร้าแลกได้เลย 🍪",
+            "subtitle_user": "เลือกของใส่ตะกร้า แล้วกดยืนยันแลกได้เลย — สรุปจะไปอยู่ในกระเป๋าคุกกี้บน Discord",
             "redeem_url": channel_link(cfg.redeem_channel) or "",
+            "invite_url": cfg.invite_url,
             "footer": f"Cookie Cheetah · อัปเดต {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}"}
     return items, meta
+
+
+MAX_CART_LINES = 20
+NONCE_RE = re.compile(r"^[A-Za-z0-9_\-.]{8,64}$")
+_cart_locks: dict = {}
+_cart_receipt_locks: dict = {}
+_bg_tasks: set = set()
+
+
+def cart_lock(uid: int) -> asyncio.Lock:
+    return _cart_locks.setdefault(uid, asyncio.Lock())
+
+
+def spawn(coro, what: str):
+    """งานเบื้องหลัง (เก็บ reference ไว้ไม่ให้โดนเก็บขยะ + log ถ้าพัง)"""
+    async def run():
+        try:
+            await coro
+        except Exception:  # noqa: BLE001
+            log.exception("งานเบื้องหลังพัง: %s", what)
+    task = asyncio.create_task(run())
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
+def redeem_cap(item, uid: int) -> int:
+    """แลกชิ้นนี้ได้อีกสูงสุดกี่ชิ้น (ยังไม่นับคุกกี้)"""
+    limit = MAX_REDEEM_QTY
+    if item["per_user_limit"]:
+        limit = min(limit, item["per_user_limit"] - db.redeemed_qty(uid, item["code"]))
+    if item["stock"] >= 0:
+        limit = min(limit, item["stock"])
+    if item["ckx"]:  # จำนวนต่อรหัสในคำสั่งเดียวต้องไม่เกิน 999
+        try:
+            limit = min(limit, ckx_link.MAX_COUNT // max(1, ckx_link.max_count(item["ckx"])))
+        except ValueError:
+            return 0
+    return max(0, limit)
+
+
+def can_redeem(member) -> tuple:
+    if is_staff(member) or has_role(member, cfg.survivor_role):
+        return True, ""
+    role = member.guild.get_role(cfg.survivor_role) if getattr(member, "guild", None) else None
+    name = role.name if role else "คุกกี้"
+    return False, f"ต้องได้ role {name} ก่อน (ขอ White List ในดิส) ถึงจะแลกของได้"
+
+
+def redemption_brief(r) -> dict:
+    icon, text = REDEEM_STATUS.get(r["status"], ("•", r["status"]))
+    return {"rid": f"RD-{r['id']:04d}", "name": r["name"], "qty": r["qty"], "cost": r["price"] * r["qty"],
+            "icon": icon, "status": text, "cart": f"C-{r['cart_id']:04d}" if r["cart_id"] else None}
+
+
+def cart_summary(cart_id: int) -> dict:
+    cart = db.cart_get(cart_id)
+    lines = db.cart_lines(cart_id)
+    return {"id": cart_id, "label": f"C-{cart_id:04d}", "total": cart["total"],
+            "has_ckx": any(r["ckx"] for r in lines), "lines": [redemption_brief(r) for r in lines]}
+
+
+class WebShop:
+    """ข้อมูลที่ web_catalog ใช้ — แยกออกมาให้ทดสอบหน้าเว็บได้โดยไม่ต้องมี Discord จริง"""
+
+    @staticmethod
+    def login_enabled() -> bool:
+        return web_shop_on()
+
+    @property
+    def secure(self) -> bool:
+        return cfg.public_url.startswith("https://")
+
+    @property
+    def public_url(self) -> str:
+        return cfg.public_url
+
+    @property
+    def client_secret(self) -> str:
+        return cfg.discord_client_secret
+
+    @staticmethod
+    def client_id() -> str:
+        return cfg.discord_client_id or str(bot.application_id or "")
+
+    @staticmethod
+    def redirect_uri() -> str:
+        return cfg.public_url + "/auth/callback"
+
+    @staticmethod
+    def secret() -> bytes:
+        value = db.setting("web:secret")
+        if not value:
+            value = secrets.token_hex(32)
+            db.set_setting("web:secret", value)
+        return value.encode()
+
+    @staticmethod
+    def session_version(uid: int) -> int:
+        return int(db.setting(f"web:sv:{uid}", "0") or 0)
+
+    @staticmethod
+    def end_sessions(uid: int):
+        """ออกจากระบบ = session ทุกเครื่องของคนนี้ใช้ไม่ได้"""
+        db.set_setting(f"web:sv:{uid}", int(db.setting(f"web:sv:{uid}", "0") or 0) + 1)
+
+    @staticmethod
+    def catalog() -> list:
+        return web_page_data()[0]
+
+    @staticmethod
+    def page_meta() -> dict:
+        return web_page_data()[1]
+
+    @staticmethod
+    def item_map() -> dict:
+        now = datetime.now(timezone.utc)
+        return {i["code"]: {"name": i["name"], "price": i["price"], "ckx": bool(i["ckx"])}
+                for i in db.shop_items() if item_state(i, now) in ("open", "hot")}
+
+    async def oauth_user(self, code: str) -> dict:
+        data = {"client_id": self.client_id(), "client_secret": cfg.discord_client_secret,
+                "grant_type": "authorization_code", "code": code, "redirect_uri": self.redirect_uri()}
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with bot.session.post("https://discord.com/api/v10/oauth2/token", data=data, timeout=timeout) as r:
+            if r.status != 200:
+                raise RuntimeError(f"แลก code ไม่ผ่าน ({r.status}): {(await r.text())[:200]}")
+            token = (await r.json())["access_token"]
+        async with bot.session.get("https://discord.com/api/v10/users/@me", timeout=timeout,
+                                   headers={"Authorization": f"Bearer {token}"}) as r:
+            if r.status != 200:
+                raise RuntimeError(f"อ่านบัญชี Discord ไม่ได้ ({r.status})")
+            return await r.json()
+
+    @staticmethod
+    async def member(uid: int):
+        """คนนี้อยู่ในเซิฟไหม — None = ไม่อยู่ · Discord ล่มชั่วคราวจะโยน HTTPException"""
+        guild = bot.get_guild(cfg.guild_id)
+        if guild is None:
+            raise RuntimeError("บอทยังไม่พร้อม")
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except discord.NotFound:
+                return None
+        return None if member.bot else member
+
+    async def me(self, uid: int) -> dict:
+        member = await self.member(uid)
+        if member is None:
+            return {"member": False}
+        w = db.wallet_ensure(uid)
+        ok, why_not = can_redeem(member)
+        now = datetime.now(timezone.utc)
+        caps, why = {}, {}
+        for item in db.shop_items():
+            state = item_state(item, now)
+            if state not in ("open", "hot"):
+                continue
+            n = redeem_cap(item, uid)
+            caps[item["code"]] = n
+            if n < 1:
+                why[item["code"]] = ("ครบสิทธิ์แล้ว" if item["per_user_limit"] and
+                                     db.redeemed_qty(uid, item["code"]) >= item["per_user_limit"] else "หมดแล้ว")
+        wallet_url = (f"https://discord.com/channels/{cfg.guild_id}/{w['thread_id']}" if w["thread_id"]
+                      else channel_link(cfg.spin_channel) or "")
+        return {"member": True, "id": str(uid), "name": member.display_name,
+                "avatar": str(member.display_avatar.url) if getattr(member, "display_avatar", None) else "",
+                "balance": w["balance"], "ingame": w["ingame"] or "", "can_redeem": ok, "reason": why_not,
+                "caps": caps, "why": why, "wallet_url": wallet_url,
+                "recent": [redemption_brief(r) for r in db.redemptions_of(uid, 8)]}
+
+    async def checkout(self, uid: int, data) -> tuple:
+        """แลกทั้งตะกร้า — คืน (HTTP status, JSON)"""
+        def fail(status, msg, code="bad", **extra):
+            return status, {"ok": False, "error": msg, "code": code, **extra}
+
+        if not isinstance(data, dict):
+            return fail(400, "ข้อมูลไม่ถูกต้อง")
+        nonce = str(data.get("nonce") or "")
+        if not NONCE_RE.fullmatch(nonce):
+            return fail(400, "ข้อมูลไม่ถูกต้อง รีเฟรชหน้าแล้วลองใหม่")
+        raw = data.get("items")
+        if not isinstance(raw, list) or not raw:
+            return fail(400, "ตะกร้าว่าง")
+        wanted: list = []
+        for line in raw:
+            if not isinstance(line, dict):
+                return fail(400, "ข้อมูลไม่ถูกต้อง")
+            code, qty = str(line.get("code") or "").strip(), line.get("qty")
+            if not code or isinstance(qty, bool) or not isinstance(qty, int) or not 1 <= qty <= MAX_REDEEM_QTY:
+                return fail(400, "จำนวนไม่ถูกต้อง")
+            wanted.append((code, qty))
+        if len(wanted) > MAX_CART_LINES:
+            return fail(400, f"ตะกร้าใส่ได้สูงสุด {MAX_CART_LINES} รายการ")
+        ingame = str(data.get("ingame") or "").strip()
+        expected = data.get("expected_total")
+
+        async with cart_lock(uid):
+            old = db.cart_by_nonce(uid, nonce)
+            if old is not None:  # กดซ้ำ / เน็ตหลุดแล้วส่งใหม่ → คืนผลเดิม ไม่หักซ้ำ
+                return await self._done(uid, old["id"], replay=True)
+            member = await self.member(uid)
+            if member is None:
+                return fail(401, "บัญชีนี้ไม่ได้อยู่ในเซิฟ Discord แล้ว", "login")
+            ok, why_not = can_redeem(member)
+            if not ok:
+                return fail(403, why_not, "role")
+            items, merged, gone = {}, {}, []
+            for code, qty in wanted:  # รวมตามรหัสจริงในร้าน (ตัวพิมพ์เล็ก/ใหญ่ไม่มีผล)
+                item = db.shop_get(code)
+                if item is None:
+                    gone.append(code)
+                    continue
+                items[item["code"]] = item
+                merged[item["code"]] = merged.get(item["code"], 0) + qty
+            if gone:
+                return fail(409, f"ไม่มีของ {', '.join(gone)} ในร้านแล้ว", "changed",
+                            state=await self.me(uid), items=self.item_map())
+            total = sum(items[c]["price"] * q for c, q in merged.items())
+            if isinstance(expected, int) and not isinstance(expected, bool) and expected != total:
+                return fail(409, "ราคาในร้านเพิ่งเปลี่ยน ดูยอดใหม่แล้วกดยืนยันอีกครั้ง", "changed",
+                            state=await self.me(uid), items=self.item_map())
+            now = datetime.now(timezone.utc)
+            for code, qty in merged.items():
+                problem = shop_problem(items[code], now)
+                cap = redeem_cap(items[code], uid)
+                if problem or qty > cap:
+                    msg = problem or ("แลกไม่ได้แล้ว" if cap < 1 else f"แลกได้อีกแค่ {cap} ชิ้น")
+                    return fail(409, f"{items[code]['name']}: {msg}", "rejected",
+                                state=await self.me(uid), items=self.item_map())
+            needs_name = any(items[c]["ckx"] for c in merged)
+            if needs_name and not ckx_link.valid_ingame(ingame):
+                return fail(400, "ใส่ชื่อในเกมที่จะรับของ (ห้ามมี \" | ` และยาวไม่เกิน 40 ตัว)", "ingame")
+            if not ckx_link.valid_ingame(ingame):
+                ingame = ""
+            ckx_items = {}
+            for code, qty in merged.items():
+                if not items[code]["ckx"]:
+                    continue
+                try:
+                    ckx_items[code] = ckx_link.normalize_items(items[code]["ckx"], multiply=qty)
+                except ValueError as e:  # จำนวนผ่าน redeem_cap แล้ว → เหลือแค่รหัสในร้านตั้งผิดจริง
+                    guild = bot.get_guild(cfg.guild_id)
+                    await mod_log(guild, f"❌ ร้านคุกกี้: รหัสของ `{code}` ผิด ({e})", COLOR_BAD)
+                    return fail(409, f"{items[code]['name']} ตั้งค่าผิด แจ้งแอดมินแล้ว เอาออกจากตะกร้าก่อนนะ",
+                                "broken")
+            cart_id, rids, err = db.redeem_cart(uid, list(merged.items()), ingame, now, nonce, ckx_items)
+            if err == "dup":
+                old = db.cart_by_nonce(uid, nonce)
+                if old is not None:
+                    return await self._done(uid, old["id"], replay=True)
+                return fail(409, "แลกซ้ำ ลองใหม่อีกครั้ง", "rejected")
+            if err:
+                return fail(409, err, "rejected", state=await self.me(uid), items=self.item_map())
+            log.info("เว็บ: %s แลกตะกร้า C-%04d (%d รายการ, %d คุกกี้)", uid, cart_id, len(rids), total)
+            spawn(cart_after_checkout(cart_id), f"ตะกร้า C-{cart_id:04d}")
+        return await self._done(uid, cart_id)
+
+    async def _done(self, uid: int, cart_id: int, replay: bool = False) -> tuple:
+        """ตอบว่าแลกสำเร็จ — ถ้าดึงข้อมูล Discord ไม่ได้ตอนนี้ก็ยังตอบสำเร็จ (ของถูกหักไปแล้ว)"""
+        try:
+            state = await self.me(uid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("เว็บ: ดึงยอดหลังแลกไม่ได้: %s", e)
+            state = None
+        body = {"ok": True, "cart": cart_summary(cart_id), "state": state, "items": self.item_map()}
+        if replay:
+            body["replay"] = True
+        return 200, body
+
+
+web_shop = WebShop()
+
+
+async def cart_after_checkout(cart_id: int):
+    """หลังแลกจากเว็บ: ส่งคำสั่งเข้าเกม + ใบแลกรวมในกระเป๋า + log แอดมิน (ทำเบื้องหลัง ไม่ให้หน้าเว็บรอ)"""
+    guild = bot.get_guild(cfg.guild_id)
+    cart = db.cart_get(cart_id)
+    if guild is None or cart is None:
+        return
+    pinged = False
+    for r in db.cart_lines(cart_id):
+        try:
+            if r["job_id"]:
+                if not await ckx_post(r["job_id"]) or not db.redemption_get(r["id"])["log_id"]:
+                    await redemption_changed(guild, r["id"], cart_receipt=False)
+            else:
+                first = not pinged and not r["log_id"]  # แท็กแอดมินครั้งเดียวต่อตะกร้า
+                await redemption_changed(guild, r["id"], notify_staff=first, cart_receipt=False)
+                pinged = pinged or first
+        except Exception:  # noqa: BLE001
+            log.exception("ตะกร้า C-%04d: RD-%s", cart_id, r["id"])
+    await cart_receipt_update(guild, cart_id)
+    await refresh_wallet(guild, cart["discord_id"])
+
+
+async def cart_sweep():
+    """เปิดบอทใหม่: ตะกร้าที่ทำค้างไว้ (ยังไม่มีใบรวม/log) → ทำต่อให้ครบ"""
+    for cart in db.carts_unfinished():
+        await cart_after_checkout(cart["id"])
+
+
+def cart_receipt_embed(cart, lines) -> discord.Embed:
+    statuses = {r["status"] for r in lines}
+    if statuses <= {"claimed", "done", "refunded", "cancelled"}:
+        color = COLOR_OK if statuses & {"claimed", "done"} else COLOR_MUTED
+    elif statuses & {"failed", "problem"}:
+        color = COLOR_BAD
+    else:
+        color = COLOR_COOKIE
+    rows = []
+    for r in lines:
+        icon, text = REDEEM_STATUS.get(r["status"], ("•", r["status"]))
+        rows.append(f"{icon} `RD-{r['id']:04d}` **{discord.utils.escape_markdown(r['name'])}** × {r['qty']} "
+                    f"· {fmt_cookies(r['price'] * r['qty'])} — {text}"
+                    + (f"\n-# {trunc(r['note'], 150)}" if r["note"] else ""))
+    embed = discord.Embed(title=f"🧾 ตะกร้า C-{cart['id']:04d} · แลกจากเว็บ", color=color,
+                          description=trunc("\n".join(rows), 4000),
+                          timestamp=datetime.fromisoformat(cart["created_at"]))
+    embed.add_field(name="ใช้คุกกี้", value=fmt_cookies(cart["total"]))
+    refunded = sum(r["price"] * r["qty"] for r in lines if r["status"] == "refunded")
+    if refunded:
+        embed.add_field(name="คืนแล้ว", value=fmt_cookies(refunded))
+    if cart["ingame"]:
+        embed.add_field(name="ชื่อในเกม", value=discord.utils.escape_markdown(cart["ingame"]))
+    if any(r["ckx"] for r in lines):
+        embed.set_footer(text="ของที่ส่งเข้าเกมเอง: เข้าเกมแล้วกดรับที่ปุ่มบ้านคุกกี้")
+    return embed
+
+
+async def cart_receipt_update(guild, cart_id: int):
+    """ใบแลกรวมของตะกร้าในกระเป๋าคุกกี้ (ข้อความเดียว แก้ตามสถานะ)"""
+    async with _cart_receipt_locks.setdefault(cart_id, asyncio.Lock()):
+        cart = db.cart_get(cart_id)
+        if guild is None or cart is None:
+            return
+        uid = cart["discord_id"]
+        member = guild.get_member(uid)
+        try:
+            thread = await ensure_wallet(guild, member or discord.Object(id=uid), create=member is not None)
+        except discord.HTTPException as e:
+            log.warning("กระเป๋าของ %s: %s", uid, e)
+            return
+        if thread is None:
+            return
+        embed = cart_receipt_embed(cart, db.cart_lines(cart_id))
+        try:
+            if cart["receipt_id"]:
+                try:
+                    await thread.get_partial_message(cart["receipt_id"]).edit(embed=embed)
+                    return
+                except discord.NotFound:
+                    pass
+            msg = await thread.send(content=f"<@{uid}>" if not cart["receipt_id"] else None, embed=embed,
+                                    allowed_mentions=discord.AllowedMentions(users=True))
+            db.cart_set_receipt(cart_id, msg.id)
+        except discord.HTTPException as e:
+            log.warning("ใบแลกตะกร้า C-%s: %s", cart_id, e)
 
 
 async def save_item_image(code: str, attachment: discord.Attachment) -> str:
@@ -4697,7 +5176,7 @@ async def start_web():
     if not cfg.web_enabled:
         return
     try:
-        runner = web.AppRunner(web_catalog.create_app(web_page_data, IMAGES_DIR), access_log=None)
+        runner = web.AppRunner(web_catalog.create_app(web_shop, IMAGES_DIR), access_log=None)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", cfg.web_port).start()
         log.info("เว็บแคตตาล็อกเปิดที่พอร์ต %s%s", cfg.web_port,
@@ -5031,6 +5510,12 @@ async def run_checks(guild: discord.Guild, panel_channel=None) -> list:
         out.append(("✅", f"หน้าเว็บร้าน: {cfg.public_url}") if cfg.public_url else
                    ("⚠️", "หน้าเว็บร้านยังไม่มีโดเมน — Railway → Settings → Networking → Generate Domain "
                           "(รูปของในร้านดิสคอร์ดก็ใช้โดเมนนี้)"))
+        if web_shop_on():
+            out.append(("✅", f"แลกของบนเว็บ: เปิดแล้ว · Developer Portal → OAuth2 → Redirects ต้องมี "
+                              f"`{cfg.public_url}/auth/callback`"))
+        elif cfg.public_url:
+            out.append(("➖", "แลกของบนเว็บ: ยังไม่ได้ตั้ง DISCORD_CLIENT_SECRET — หน้าเว็บเป็นแคตตาล็อกดูอย่างเดียว "
+                              "(แลกในดิสแทน)"))
     pool = db.spin_pool()
     out.append(("✅", f"วงล้อมีรางวัล {len(pool)} แบบ") if pool else ("➖", "วงล้อยังไม่มีรางวัล (/spin add)"))
 
