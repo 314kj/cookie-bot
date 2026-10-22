@@ -16,6 +16,7 @@ CookieCheetah Bot — welcome + ticket (private thread) + whitelist + Steam + Do
 """
 
 import asyncio
+import hashlib
 import html
 import io
 import json
@@ -41,6 +42,7 @@ from discord import app_commands, ui
 import faq_engine
 import ckx_link
 import web_catalog
+import web_site
 
 try:
     from dotenv import load_dotenv
@@ -264,6 +266,7 @@ class Config:
     discord_client_id: str = ""      # ว่าง = ใช้ Application ID ของบอทนี้
     discord_client_secret: str = ""  # มีค่า = เปิดล็อกอินด้วย Discord + แลกของบนเว็บ
     invite_url: str = ""             # ลิงก์เชิญเข้าดิส (โชว์บนเว็บถ้าคนล็อกอินไม่ได้อยู่ในเซิฟ)
+    web_editor_ids: list = field(default_factory=list)  # user ID ที่แก้ร้านบนเว็บได้ (ว่าง = เจ้าของเซิฟคนเดียว)
     auto_close_after_decision: bool = True
     utc_offset: int = 7
     accent_color: int = 0x22C7E8
@@ -401,6 +404,7 @@ def load_config(env: Mapping[str, str]) -> Config:
         discord_client_id=_str(env, "DISCORD_CLIENT_ID"),
         discord_client_secret=_str(env, "DISCORD_CLIENT_SECRET"),
         invite_url=_str(env, "DISCORD_INVITE_URL"),
+        web_editor_ids=_ids(env, "WEB_EDITOR_IDS"),
         auto_close_after_decision=_bool(env, "AUTO_CLOSE_AFTER_DECISION", True),
         utc_offset=_int(env, "UTC_OFFSET", 7),
         accent_color=_color(env, "ACCENT_COLOR", 0x22C7E8),
@@ -630,12 +634,17 @@ class Database:
                 ("orders", "ingame TEXT NOT NULL DEFAULT ''"),
                 ("orders", "job_id INTEGER"),
                 ("orders", "cookies_given INTEGER NOT NULL DEFAULT 0"),
-                ("redemptions", "cart_id INTEGER")):
+                ("redemptions", "cart_id INTEGER"),
+                ("orders", "web_nonce TEXT"),
+                ("items", "image TEXT NOT NULL DEFAULT ''")):
             try:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
             except sqlite3.OperationalError:
                 pass
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_redeem_cart ON redemptions(cart_id)")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_web ON orders(owner_id, web_nonce) "
+                          "WHERE web_nonce IS NOT NULL")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_owner ON orders(owner_id, id)")
         self.conn.commit()
 
     @staticmethod
@@ -743,16 +752,16 @@ class Database:
         q = "SELECT * FROM items" + (" WHERE active=1" if active_only else "") + " ORDER BY sort, code"
         return self.conn.execute(q).fetchall()
 
-    def item_add(self, code, name, price, description="", sort=0, cookies=0, ckx=""):
+    def item_add(self, code, name, price, description="", sort=0, cookies=0, ckx="", active=1, image=""):
         with self.conn:
             self.conn.execute(
-                "INSERT INTO items(code, name, price, description, active, sort, updated_at, cookies, ckx) "
-                "VALUES(?,?,?,?,1,?,?,?,?)",
-                (code, name, price, description, sort, self._now(), cookies, ckx))
+                "INSERT INTO items(code, name, price, description, active, sort, updated_at, cookies, ckx, image) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (code, name, price, description, int(active), sort, self._now(), cookies, ckx, image or ""))
 
     def item_update(self, old_code, **fields):
-        """fields: code (รหัสใหม่) / name / price / description / active / sort / cookies / ckx — ค่า None = ไม่แก้"""
-        allowed = {"code", "name", "price", "description", "active", "sort", "cookies", "ckx"}
+        """fields: code (รหัสใหม่) / name / price / description / active / sort / cookies / ckx / image — None = ไม่แก้"""
+        allowed = {"code", "name", "price", "description", "active", "sort", "cookies", "ckx", "image"}
         sets = {k: v for k, v in fields.items() if k in allowed and v is not None}
         if not sets:
             return
@@ -800,6 +809,31 @@ class Database:
         cols = ", ".join(f"{k}=?" for k in sets)
         with self.conn:
             self.conn.execute(f"UPDATE orders SET {cols} WHERE id=?", (*sets.values(), order_id))
+
+    def order_create_web(self, ticket_id, thread_id, owner_id, nonce, lines, total, ingame):
+        """ออเดอร์จากหน้าเว็บ (ข้ามขั้นตะกร้า → รอยืนยัน) — nonce เดิมของคนเดิม = None (กดซ้ำ)"""
+        try:
+            with self.conn:
+                return self.conn.execute(
+                    "INSERT INTO orders(ticket_id, thread_id, owner_id, lines, total, status, ingame, web_nonce, "
+                    "created_at) VALUES(?,?,?,?,?,'review',?,?,?)",
+                    (ticket_id, thread_id, owner_id, json.dumps(lines, ensure_ascii=False), total, ingame, nonce,
+                     self._now())).lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+    def order_by_nonce(self, owner_id, nonce):
+        return self.conn.execute("SELECT * FROM orders WHERE owner_id=? AND web_nonce=?", (owner_id, nonce)).fetchone()
+
+    def orders_of(self, owner_id, limit=10):
+        """ออเดอร์ล่าสุดของคนนี้ (ไม่รวมตะกร้าที่ยังไม่ส่งใน Discord)"""
+        return self.conn.execute("SELECT * FROM orders WHERE owner_id=? AND status != 'cart' ORDER BY id DESC LIMIT ?",
+                                 (owner_id, limit)).fetchall()
+
+    def orders_in_thread(self, thread_id, statuses):
+        marks = ",".join("?" * len(statuses))
+        return self.conn.execute(f"SELECT * FROM orders WHERE thread_id=? AND status IN ({marks}) ORDER BY id DESC",
+                                 (thread_id, *statuses)).fetchall()
 
     # --- settings (แก้ใน Discord ได้) ---
     def setting(self, key, default=None):
@@ -961,14 +995,17 @@ class Database:
         cols = ", ".join(f"{k}=?" for k in sets)
         with self.conn:
             self.conn.execute(f"UPDATE shop_items SET {cols} WHERE code=?", (*sets.values(), old_code))
+            if sets.get("code") and sets["code"] != old_code:  # เปลี่ยนรหัส → ใบแลกเดิมตามไปด้วย (สิทธิ์ต่อคน/คืนสต็อก)
+                self.conn.execute("UPDATE redemptions SET code=? WHERE code=? COLLATE NOCASE",
+                                  (sets["code"], old_code))
 
     def shop_delete(self, code) -> bool:
         with self.conn:
             return self.conn.execute("DELETE FROM shop_items WHERE code=?", (code,)).rowcount > 0
 
     def redeemed_qty(self, discord_id, code) -> int:
-        row = self.conn.execute("SELECT COALESCE(SUM(qty),0) FROM redemptions WHERE discord_id=? AND code=? "
-                                "AND status != 'refunded'", (discord_id, code)).fetchone()
+        row = self.conn.execute("SELECT COALESCE(SUM(qty),0) FROM redemptions WHERE discord_id=? "
+                                "AND code=? COLLATE NOCASE AND status != 'refunded'", (discord_id, code)).fetchone()
         return int(row[0])
 
     def redeem(self, discord_id, code, qty, ingame, now: datetime):
@@ -1082,6 +1119,13 @@ class Database:
         cols = ", ".join(f"{k}=?" for k in sets)
         with self.conn:
             self.conn.execute(f"UPDATE redemptions SET {cols} WHERE id=?", (*sets.values(), rid))
+
+    def redeem_stats(self, discord_id) -> dict:
+        row = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(price*qty),0), "
+            "SUM(CASE WHEN status IN ('queued','posting','sent','inqueue','seen','partial','manual') THEN 1 ELSE 0 END) "
+            "FROM redemptions WHERE discord_id=? AND status != 'refunded'", (discord_id,)).fetchone()
+        return {"count": int(row[0] or 0), "spent": int(row[1] or 0), "pending": int(row[2] or 0)}
 
     def redemptions_of(self, discord_id, limit=6):
         return self.conn.execute("SELECT * FROM redemptions WHERE discord_id=? ORDER BY id DESC LIMIT ?",
@@ -1329,7 +1373,7 @@ class StripeClient:
 
     async def create_checkout(self, *, order_id: int, owner_id: int, lines: list, currency: str,
                               success_url: str, expires_at: int, payment_methods: list,
-                              idempotency_key: str) -> dict:
+                              idempotency_key: str, cancel_url: str = "") -> dict:
         data = {
             "mode": "payment",
             "submit_type": "donate",
@@ -1345,6 +1389,8 @@ class StripeClient:
                                "product_data": {"name": f"[{line['code']}] {line['name']}"[:250]}},
             } for line in lines],
         }
+        if cancel_url:  # ปุ่มย้อนกลับในหน้าจ่าย (ออเดอร์จากเว็บ)
+            data["cancel_url"] = cancel_url
         if payment_methods:
             data["payment_method_types"] = payment_methods
         return await self._request("POST", "/checkout/sessions", data, idempotency_key)
@@ -2269,13 +2315,17 @@ async def add_staff_to_thread(guild, thread, exclude: int = 0) -> int:
 
 
 async def create_ticket(interaction: discord.Interaction, t: TicketType, answers: dict):
-    guild = interaction.guild
-    member = interaction.user
+    thread, err = await open_ticket_thread(interaction.guild, interaction.user, t, answers)
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+    return thread
+
+
+async def open_ticket_thread(guild, member, t: TicketType, answers: dict, via: str = ""):
+    """สร้างห้อง ticket — คืน (thread, None) หรือ (None, ข้อความ error) · ไม่ต้องมี interaction (เว็บเรียกได้)"""
     parent = guild.get_channel(cfg.ticket_channel)
     if not isinstance(parent, discord.TextChannel):
-        await interaction.followup.send("ตั้ง TICKET_CHANNEL_ID ไม่ถูก (ต้องเป็น ID ของห้องข้อความ) — แจ้งแอดมิน",
-                                        ephemeral=True)
-        return None
+        return None, "ตั้ง TICKET_CHANNEL_ID ไม่ถูก (ต้องเป็น ID ของห้องข้อความ) — แจ้งแอดมิน"
     number = db.next_number(t.key)
     try:
         thread = await parent.create_thread(
@@ -2284,13 +2334,10 @@ async def create_ticket(interaction: discord.Interaction, t: TicketType, answers
             reason=f"ticket โดย {member}")
         await thread.add_user(member)
     except discord.Forbidden:
-        await interaction.followup.send(
-            "บอทสร้าง ticket ไม่ได้ — ขาดสิทธิ์ในห้อง ticket (Create Private Threads / Manage Threads) "
-            "แจ้งแอดมินให้รัน /check", ephemeral=True)
-        return None
+        return None, ("บอทสร้าง ticket ไม่ได้ — ขาดสิทธิ์ในห้อง ticket (Create Private Threads / Manage Threads) "
+                      "แจ้งแอดมินให้รัน /check")
     except discord.HTTPException as e:
-        await interaction.followup.send(f"สร้าง ticket ไม่สำเร็จ: {e.text or e}", ephemeral=True)
-        return None
+        return None, f"สร้าง ticket ไม่สำเร็จ: {e.text or e}"
 
     ticket_id = db.create_ticket(t.key, number, thread.id, member.id, answers)
     bot_first = bool(t.faq_start) and FAQ is not None
@@ -2312,9 +2359,10 @@ async def create_ticket(interaction: discord.Interaction, t: TicketType, answers
     except discord.HTTPException as e:
         log.error("ส่งข้อความแรกใน ticket ไม่ได้: %s", e)
     await mod_log(guild, f"🎫 เปิด {thread.mention} ({t.label}) โดย {member.mention} · ticket #{ticket_id}"
-                         + (" · 🤖 บอทถามตอบก่อน" if bot_first else ""), COLOR_INFO)
+                         + (" · 🤖 บอทถามตอบก่อน" if bot_first else "")
+                         + (" · 🌐 จากหน้าเว็บ" if via == "web" else ""), COLOR_INFO)
     board_dirty()
-    return thread
+    return thread, None
 
 
 # ---------------------------------------------------------------------
@@ -3118,64 +3166,149 @@ class DeliverView(BaseView):
 
 async def create_bill(interaction: discord.Interaction, order_id: int):
     """สร้าง Checkout Session แล้วเปลี่ยนการ์ดเป็น 'รอชำระ' (เรียกหลัง defer)"""
-    async with order_lock(order_id):
-        order = db.order_get(order_id)
-        if order is None or order["status"] not in ("review", "expired"):
-            return await interaction.followup.send("รายการนี้ไม่อยู่ในสถานะที่ยืนยันได้แล้ว", ephemeral=True)
-        lines = lines_of(order)
-        # ราคาอิงตอนใส่ตะกร้า ถ้าแอดมินปิดรายการระหว่างนั้น ให้แจ้งก่อน
-        gone = [line["code"] for line in lines if line["code"] != TOPUP_CODE
-                and not (db.item_get(line["code"]) or {"active": 0})["active"]]
-        if gone:
+    order = db.order_get(order_id)
+    if order is None:
+        return await interaction.followup.send("ไม่พบรายการนี้แล้ว", ephemeral=True)
+    # สร้างบิลทีละใบต่อคน (กดในดิสพร้อมกับสั่งบนเว็บ → ไม่ได้บิลค้างสองใบ) · ลำดับล็อก: user → order เหมือนฝั่งเว็บ
+    async with user_lock(order["owner_id"]), order_lock(order_id):
+        order, err = await _bill_locked(order_id, interaction.guild)
+        if err:
+            return await interaction.followup.send(err, ephemeral=True)
+        await interaction.message.edit(embed=payment_embed(order, lines_of(order)), view=PaymentView(order["stripe_url"]))
+
+
+async def _bill_locked(order_id: int, guild, via: str = "discord"):
+    """สร้างบิล Stripe ให้ออเดอร์ review/expired — คืน (order, None) หรือ (None, error)
+    ต้องถือ user_lock(เจ้าของ) แล้ว order_lock อยู่ · via='web' → จ่ายเสร็จ/กดย้อนกลับ กลับมาหน้า Donate บนเว็บ"""
+    order = db.order_get(order_id)
+    if order is None or order["status"] not in ("review", "expired"):
+        return None, "รายการนี้ไม่อยู่ในสถานะที่ยืนยันได้แล้ว"
+    other = [o for o in db.orders_in_thread(order["thread_id"], ("pending",))
+             if o["owner_id"] == order["owner_id"] and o["id"] != order_id]
+    if other:  # ห้องเดียวมีบิลรอจ่ายได้ใบเดียว (กันจ่ายซ้ำสองใบ)
+        return None, f"มีบิล #{other[0]['id']:04d} รอจ่ายอยู่ — จ่ายหรือยกเลิกบิลนั้นก่อน"
+    lines = lines_of(order)
+    # ราคาอิงตอนใส่ตะกร้า ถ้าแอดมินปิดรายการระหว่างนั้น ให้แจ้งก่อน
+    gone = [line["code"] for line in lines if line["code"] != TOPUP_CODE
+            and not (db.item_get(line["code"]) or {"active": 0})["active"]]
+    if gone:
+        if via == "web":
+            how = "ยกเลิกรายการนี้แล้วเลือกใหม่"
+        else:
             how = "กด 📝 แก้ไข เพื่อเอาออก" if order["status"] == "review" else "กดยกเลิกแล้วทำรายการใหม่"
-            return await interaction.followup.send(f"รายการ {', '.join(gone)} ถูกปิดไปแล้ว — {how}", ephemeral=True)
-        if stripe is None:
-            return await interaction.followup.send("ระบบ Donate ปิดอยู่ (ยังไม่ได้ตั้ง STRIPE_SECRET_KEY)", ephemeral=True)
-        attempt = order["attempt"] + 1
-        expires_at = int(time.time()) + cfg.stripe_session_minutes * 60
+        return None, f"รายการ {', '.join(gone)} ถูกปิดไปแล้ว — {how}"
+    if stripe is None:
+        return None, "ระบบ Donate ปิดอยู่ (ยังไม่ได้ตั้ง STRIPE_SECRET_KEY)"
+    attempt = order["attempt"] + 1
+    # จดรอบไว้ก่อนเรียก Stripe: ถ้าหมดเวลาแต่ Stripe สร้างไปแล้ว รอบหน้าใช้ key ใหม่ (ไม่ชน idempotency)
+    # บิลที่หลุดไปไม่เคยโชว์ลิงก์ให้ใคร จึงจ่ายไม่ได้ และหมดอายุไปเอง
+    db.order_update(order_id, attempt=attempt)
+    expires_at = int(time.time()) + cfg.stripe_session_minutes * 60
+    if via == "web" and cfg.public_url:
+        back = f"{cfg.public_url}/donate?order={order['id']}"
+        urls = {"success_url": f"{cfg.public_url}/donate?paid={order['id']}", "cancel_url": back}
+    else:
+        urls = {"success_url": f"https://discord.com/channels/{cfg.guild_id}/{order['thread_id']}"}
+    try:
+        session = await stripe.create_checkout(
+            order_id=order["id"], owner_id=order["owner_id"], lines=lines, currency=cfg.stripe_currency,
+            expires_at=expires_at, payment_methods=cfg.stripe_payment_methods,
+            idempotency_key=f"cookiecheetah-order-{order['id']}-{attempt}", **urls)
+    except StripeError as e:
+        log.error("สร้างบิล Stripe ไม่ได้ (order %s): %s", order_id, e)
+        await mod_log(guild, f"❌ สร้างบิล Stripe ไม่ได้ (Donate #{order_id:04d}): {e}", COLOR_BAD)
+        return None, "❌ สร้างบิลไม่สำเร็จ ลองกดยืนยันอีกครั้ง (ถ้ายังไม่ได้ แจ้งแอดมิน)"
+    db.order_update(order_id, status="pending", attempt=attempt, stripe_session=session["id"],
+                    stripe_url=session["url"], stripe_expires=session.get("expires_at") or expires_at,
+                    total=cart_total(lines))
+    order = db.order_get(order_id)
+    await mod_log(guild, f"💳 บิล Donate #{order_id:04d} {fmt_baht(order['total'])} "
+                         f"โดย <@{order['owner_id']}> · <#{order['thread_id']}>" + (" · 🌐 เว็บ" if via == "web" else ""),
+                  COLOR_WAIT)
+    return order, None
+
+
+async def _cancel_locked(order_id: int) -> tuple:
+    """ยกเลิกออเดอร์ (ต้องถือ order_lock) — คืน ('cancelled'|'paid'|'closed'|'error', ข้อความ)
+    บิลที่ยังเปิดอยู่ที่ Stripe จะถูกปิดก่อน · ถ้าจ่ายไปแล้วจะไม่ยกเลิก"""
+    order = db.order_get(order_id)
+    if order is None or order["status"] in ("paid", "delivered", "cancelled"):
+        return "closed", "ยกเลิกรายการนี้ไม่ได้แล้ว"
+    if order["status"] == "pending" and order["stripe_session"]:
+        if stripe is None:  # ปิดบิลที่ Stripe ไม่ได้ → ห้ามยกเลิก (บิลยังจ่ายได้อยู่)
+            return "error", "ยกเลิกบิลไม่ได้ตอนนี้ (ยังไม่ได้ตั้ง STRIPE_SECRET_KEY)"
         try:
-            session = await stripe.create_checkout(
-                order_id=order["id"], owner_id=order["owner_id"], lines=lines, currency=cfg.stripe_currency,
-                success_url=f"https://discord.com/channels/{cfg.guild_id}/{order['thread_id']}",
-                expires_at=expires_at, payment_methods=cfg.stripe_payment_methods,
-                idempotency_key=f"cookiecheetah-order-{order['id']}-{attempt}")
+            session = await stripe.get_session(order["stripe_session"])
+            if session.get("payment_status") == "paid":
+                return "paid", "บิลนี้จ่ายแล้ว ยกเลิกไม่ได้"
+            if session.get("status") == "open":
+                await stripe.expire_session(order["stripe_session"])
+            elif session.get("status") != "expired":  # complete แต่ยังไม่ paid = เงินกำลังยืนยัน
+                return "error", "บิลนี้กำลังรอยืนยันการจ่ายเงิน — ยกเลิกไม่ได้ตอนนี้ ลองกดเช็คสถานะอีกครั้ง"
         except StripeError as e:
-            log.error("สร้างบิล Stripe ไม่ได้ (order %s): %s", order_id, e)
-            await mod_log(interaction.guild, f"❌ สร้างบิล Stripe ไม่ได้ (Donate #{order_id:04d}): {e}", COLOR_BAD)
-            return await interaction.followup.send("❌ สร้างบิลไม่สำเร็จ ลองกดยืนยันอีกครั้ง (ถ้ายังไม่ได้ แจ้งแอดมิน)",
-                                                   ephemeral=True)
-        db.order_update(order_id, status="pending", attempt=attempt, stripe_session=session["id"],
-                        stripe_url=session["url"], stripe_expires=session.get("expires_at") or expires_at,
-                        total=cart_total(lines))
-        order = db.order_get(order_id)
-        await interaction.message.edit(embed=payment_embed(order, lines), view=PaymentView(order["stripe_url"]))
-        await mod_log(interaction.guild, f"💳 บิล Donate #{order_id:04d} {fmt_baht(order['total'])} "
-                                         f"โดย <@{order['owner_id']}> · <#{order['thread_id']}>", COLOR_WAIT)
+            return "error", f"ยกเลิกบิลที่ Stripe ไม่ได้: {e}"
+    db.order_update(order_id, status="cancelled")
+    return "cancelled", ""
 
 
 async def cancel_order(interaction: discord.Interaction, order):
     await interaction.response.defer()  # คุยกับ Stripe อาจเกิน 3 วินาที
-    already_paid = False
     async with order_lock(order["id"]):
-        order = db.order_get(order["id"])
-        if order["status"] in ("paid", "delivered", "cancelled"):
-            return await interaction.followup.send("ยกเลิกรายการนี้ไม่ได้แล้ว", ephemeral=True)
-        if order["status"] == "pending" and order["stripe_session"] and stripe:
-            try:
-                session = await stripe.get_session(order["stripe_session"])
-                if session.get("payment_status") == "paid":
-                    already_paid = True
-                elif session.get("status") == "open":
-                    await stripe.expire_session(order["stripe_session"])
-            except StripeError as e:
-                return await interaction.followup.send(f"ยกเลิกบิลที่ Stripe ไม่ได้: {e}", ephemeral=True)
-        if not already_paid:
-            db.order_update(order["id"], status="cancelled")
+        result, text = await _cancel_locked(order["id"])
+        if result == "cancelled":
+            order = db.order_get(order["id"])
             await interaction.edit_original_response(
                 embed=closed_order_embed(order, lines_of(order), "ยกเลิกแล้ว"), view=None)
-    if already_paid:
+    if result in ("closed", "error"):
+        return await interaction.followup.send(text, ephemeral=True)
+    if result == "paid":
         await interaction.followup.send("บิลนี้จ่ายแล้ว ยกเลิกไม่ได้ — อัปเดตการ์ดให้แล้ว", ephemeral=True)
         await sync_payment(order["id"])
+
+
+async def post_order_card(order_id: int, note: str = "", title: str = ""):
+    """การ์ดออเดอร์ในห้อง Donate ตามสถานะตอนนี้ (ใช้ตอนสั่ง/จ่าย/ยกเลิกจากเว็บ)
+    มีการ์ดเดิม → แก้การ์ดเดิม · ไม่มี → โพสต์ใหม่พร้อม note · จ่ายแล้วไม่แตะ (on_paid ดูแลเอง)"""
+    guild = bot.get_guild(cfg.guild_id)
+    if guild is None:
+        return
+    async with order_lock(order_id):
+        order = db.order_get(order_id)
+        if order is None:
+            return
+        lines = lines_of(order)
+        if order["status"] == "pending":
+            embed, view = payment_embed(order, lines), PaymentView(order["stripe_url"])
+        elif order["status"] == "review":
+            embed, view = review_embed(order, lines), ReviewView()
+        elif order["status"] == "expired":
+            embed = closed_order_embed(order, lines, "บิลหมดอายุ", COLOR_MUTED).set_footer(
+                text="กด 🔁 สร้างบิลใหม่ ถ้ายังต้องการ Donate รายการนี้")
+            view = ExpiredView()
+        elif order["status"] == "cancelled":
+            embed, view = closed_order_embed(order, lines, title or "ยกเลิกแล้ว"), None
+        else:
+            return
+        thread = await get_thread(guild, order["thread_id"], unarchive=True)
+        if thread is None:
+            return
+        if order["message_id"]:
+            try:
+                await thread.get_partial_message(order["message_id"]).edit(embed=embed, view=view)
+                return
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as e:
+                log.warning("แก้การ์ด Donate #%s ไม่ได้: %s", order_id, e)
+                return
+        if order["status"] == "cancelled":
+            return
+        try:
+            msg = await thread.send(note or None, embed=embed, view=view,
+                                    allowed_mentions=discord.AllowedMentions(users=True))
+            db.order_update(order_id, message_id=msg.id)
+        except discord.HTTPException as e:
+            log.warning("โพสต์การ์ด Donate #%s ไม่ได้: %s", order_id, e)
 
 
 async def sync_payment(order_id: int) -> str:
@@ -4769,32 +4902,83 @@ def web_shop_on() -> bool:
     return bool(cfg.web_enabled and secure and cfg.discord_client_secret)
 
 
+def _local_input(iso: str) -> str:
+    """ISO (UTC) → '2026-10-25T18:00' เวลาไทย สำหรับช่อง datetime-local"""
+    return datetime.fromisoformat(iso).astimezone(TZ).strftime("%Y-%m-%dT%H:%M") if iso else ""
+
+
+def web_item(i, now: datetime) -> dict:
+    """ของ 1 ชิ้นสำหรับหน้าเว็บ (ใช้กรอง/เรียงฝั่งเว็บด้วย)"""
+    state = item_state(i, now)
+    return {
+        "code": i["code"], "name": i["name"], "description": i["description"], "price": i["price"],
+        "category": i["category"], "limit": i["per_user_limit"], "ckx": bool(i["ckx"]),
+        "stock": i["stock"] if i["stock"] >= 0 else None, "state": state, "active": bool(i["active"]),
+        "image_url": f"/img/{i['image']}?v={_ts(i['updated_at']) or 0}" if i["image"] else "",
+        "start": datetime.fromisoformat(i["start_at"]).astimezone(TZ) if i["start_at"] else None,
+        "end": datetime.fromisoformat(i["end_at"]).astimezone(TZ) if i["end_at"] else None,
+        "end_ts": _ts(i["end_at"]) if i["end_at"] else 0, "updated_ts": _ts(i["updated_at"]) or 0,
+        "sort": i["sort"],
+    }
+
+
 def web_page_data():
     now = datetime.now(timezone.utc)
-    items = []
-    for i in db.shop_items():
-        state = item_state(i, now)
-        if state == "ended":
-            continue
-        items.append({
-            "code": i["code"], "name": i["name"], "description": i["description"], "price": i["price"],
-            "category": i["category"], "limit": i["per_user_limit"], "ckx": bool(i["ckx"]),
-            "stock": i["stock"] if i["stock"] >= 0 else None, "state": state,
-            "image_url": f"/img/{i['image']}?v={_ts(i['updated_at']) or 0}" if i["image"] else "",
-            "start": datetime.fromisoformat(i["start_at"]).astimezone(TZ) if i["start_at"] else None,
-            "end": datetime.fromisoformat(i["end_at"]).astimezone(TZ) if i["end_at"] else None,
-        })
-    meta = {"title": "Cookie Shop",
-            "subtitle": "แลกของในเกมด้วยคุกกี้ 🍪 จากวงล้อรายวันและการ Donate · กดแลกได้ในดิสคอร์ด",
-            "subtitle_login": "ล็อกอินด้วย Discord เพื่อดูคุกกี้ของคุณ แล้วเลือกของใส่ตะกร้าแลกได้เลย 🍪",
-            "subtitle_user": "เลือกของใส่ตะกร้า แล้วกดยืนยันแลกได้เลย — สรุปจะไปอยู่ในกระเป๋าคุกกี้บน Discord",
+    items = [web_item(i, now) for i in db.shop_items() if item_state(i, now) != "ended"]
+    custom_sub = db.setting("web:subtitle") or ""
+    meta = {"title": db.setting("web:title") or "Cookie Shop",
+            "subtitle": custom_sub or "แลกของในเกมด้วยคุกกี้ 🍪 จากวงล้อรายวันและการ Donate · กดแลกได้ในดิสคอร์ด",
+            "subtitle_login": custom_sub or "ล็อกอินด้วย Discord เพื่อดูคุกกี้ของคุณ แล้วเลือกของใส่ตะกร้าแลกได้เลย 🍪",
+            "subtitle_user": custom_sub or "เลือกของใส่ตะกร้า แล้วกดยืนยันแลกได้เลย — สรุปจะไปอยู่ในกระเป๋าคุกกี้บน Discord",
+            "subtitle_raw": custom_sub, "notice": db.setting("web:notice") or "",
+            "cat_info": web_cat_info(),
             "redeem_url": channel_link(cfg.redeem_channel) or "",
-            "invite_url": cfg.invite_url,
-            "footer": f"Cookie Cheetah · อัปเดต {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}"}
+            "invite_url": cfg.invite_url, "discord_url": channel_link(cfg.redeem_channel) or "",
+            "footer": f"Cookie Cheetah · อัปเดต {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}",
+            "site": web_site.load(db.setting("web:site")), "site_rev": site_rev(), "spin_url": channel_link(cfg.spin_channel) or "",
+            "support_url": channel_link(cfg.ticket_channel) or "", "donate_on": bool(cfg.donate_enabled and stripe)}
     return items, meta
 
 
-MAX_CART_LINES = 20
+def web_cat_info() -> dict:
+    """คำอธิบายหมวด (แก้บนเว็บ) {ชื่อหมวด: ข้อความ}"""
+    try:
+        data = json.loads(db.setting("web:catinfo") or "{}")
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def sniff_image(data: bytes) -> Optional[str]:
+    """ดูจากเนื้อไฟล์จริง ไม่เชื่อนามสกุล"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def write_item_image(code: str, ext: str, data: bytes) -> str:
+    """ชื่อไฟล์ไม่ซ้ำทุกครั้ง (ของเปลี่ยนรหัสแล้วมีของใหม่ใช้รหัสเดิม → ไม่ทับรูปกัน) · ลบรูปเก่าที่ผู้เรียก"""
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", code).lower()
+    name = f"{safe}-{secrets.token_hex(4)}.{ext}"
+    tmp = IMAGES_DIR / f".{name}.tmp"
+    tmp.write_bytes(data)
+    tmp.replace(IMAGES_DIR / name)
+    return name
+
+
+def drop_item_image(name: str):
+    if name and re.fullmatch(r"[A-Za-z0-9_\-]{1,40}\.(png|jpg|jpeg|webp|gif)", name):
+        (IMAGES_DIR / name).unlink(missing_ok=True)
+
+
+WEB_CART_LINES = 20
 NONCE_RE = re.compile(r"^[A-Za-z0-9_\-.]{8,64}$")
 _cart_locks: dict = {}
 _cart_receipt_locks: dict = {}
@@ -4844,7 +5028,7 @@ def can_redeem(member) -> tuple:
 def redemption_brief(r) -> dict:
     icon, text = REDEEM_STATUS.get(r["status"], ("•", r["status"]))
     return {"rid": f"RD-{r['id']:04d}", "name": r["name"], "qty": r["qty"], "cost": r["price"] * r["qty"],
-            "icon": icon, "status": text, "cart": f"C-{r['cart_id']:04d}" if r["cart_id"] else None}
+            "icon": icon, "status": text, "key": r["status"], "cart": f"C-{r['cart_id']:04d}" if r["cart_id"] else None}
 
 
 def cart_summary(cart_id: int) -> dict:
@@ -4852,6 +5036,87 @@ def cart_summary(cart_id: int) -> dict:
     lines = db.cart_lines(cart_id)
     return {"id": cart_id, "label": f"C-{cart_id:04d}", "total": cart["total"],
             "has_ckx": any(r["ckx"] for r in lines), "lines": [redemption_brief(r) for r in lines]}
+
+
+# ---------------------------------------------------------------- Donate บนเว็บ (ใช้ระบบออเดอร์เดียวกับห้อง Donate)
+
+DONATE_STATUS_WEB = {"cart": "ยังไม่ส่ง", "review": "รอยืนยัน", "pending": "รอชำระเงิน", "expired": "บิลหมดอายุ",
+                     "paid": "ได้รับยอดแล้ว · กำลังส่งของ", "delivered": "ส่งของครบแล้ว", "cancelled": "ยกเลิกแล้ว"}
+DONATE_STEP = {"review": 1, "pending": 1, "expired": 1, "paid": 2, "delivered": 3}
+DONATE_TOPUP_MAX = 100_000  # บาท ต่อรอบ (เท่ากับในห้อง Donate)
+_donate_checked: dict = {}
+_site_lock = asyncio.Lock()
+
+
+def site_rev() -> str:
+    """เลขรุ่นของการตั้งค่าหน้าเว็บ (กันแก้ทับกันจากสองหน้าต่าง)"""
+    return hashlib.sha1((db.setting("web:site") or "").encode()).hexdigest()[:12]
+
+
+def donate_rate() -> int:
+    try:
+        return max(0, int(db.setting("cookie_rate", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def donate_item_web(i) -> dict:
+    kind = "pack" if i["cookies"] else ("game" if i["ckx"] else "manual")
+    image = i["image"] if "image" in i.keys() else ""
+    return {"code": i["code"], "name": i["name"], "description": i["description"], "price": i["price"],
+            "cookies": i["cookies"], "ckx": bool(i["ckx"]), "kind": kind, "active": bool(i["active"]),
+            "image_url": f"/img/{image}?v={_ts(i['updated_at']) or 0}" if image else ""}
+
+
+def donate_progress(order, lines: list) -> list:
+    """สถานะส่งของแบบอ่านง่ายบนเว็บ [{k: ok|wait|bad, t: ข้อความ}] (คู่กับ delivery_text ในดิส)"""
+    out, delivered = [], order["status"] == "delivered"
+    cookies = sum(int(line.get("cookies") or 0) * int(line["qty"]) for line in lines)
+    if cookies:
+        out.append({"k": "ok", "t": f"เติม {cookies:,} คุกกี้เข้ากระเป๋าแล้ว"} if order["cookies_given"]
+                   else {"k": "wait", "t": f"รอเติม {cookies:,} คุกกี้"})
+    if order_ckx_lines(lines):
+        job = db.job_get(order["job_id"]) if order["job_id"] else None
+        if job is not None and job["status"] == "claimed":
+            out.append({"k": "ok", "t": f"ของในเกม: รับในเกมแล้ว (ชื่อ {job['ingame']})"})
+        elif delivered:
+            out.append({"k": "ok", "t": "ของในเกม: แอดมินยืนยันส่งแล้ว"})
+        elif job is None:
+            out.append({"k": "wait", "t": "รอใส่ชื่อในเกมเพื่อส่งของ (กดในห้อง Donate บน Discord)"})
+        else:
+            _, text = REDEEM_STATUS.get(job["status"], ("", job["status"]))
+            bad = job["status"] in ("failed", "problem", "cancelled")
+            out.append({"k": "bad" if bad else "wait",
+                        "t": f"ของในเกม: {text} (ชื่อ {job['ingame']})" + (" — แอดมินจะส่งให้เอง" if bad else "")})
+    manual = order_manual_lines(lines)
+    if manual:
+        names = ", ".join(f"{line['name']} × {line['qty']}" for line in manual)
+        out.append({"k": "ok", "t": f"แอดมินส่งแล้ว: {names}"} if delivered
+                   else {"k": "wait", "t": f"รอแอดมินส่งในเกม: {names}"})
+    return out or [{"k": "ok" if delivered else "wait", "t": "ส่งของครบแล้ว" if delivered else "รอแอดมินส่งของ"}]
+
+
+def donate_brief(order) -> dict:
+    """ออเดอร์ 1 รายการสำหรับหน้าเว็บ (ของเจ้าของเท่านั้น)"""
+    lines = lines_of(order)
+    status = order["status"]
+    live = status == "pending" and (order["stripe_expires"] or 0) > time.time() + 30
+    url = order["stripe_url"] or ""
+    ckx = bool(order_ckx_lines(lines))
+    ingame = order_ingame(order) if ckx else ""
+    actions = {"review": ["pay", "cancel"], "pending": (["pay"] if live else []) + ["check", "cancel"],
+               "expired": ["renew", "cancel"]}.get(status, [])
+    return {"id": order["id"], "label": f"#{order['id']:04d}", "status": status,
+            "text": DONATE_STATUS_WEB.get(status, status), "step": DONATE_STEP.get(status, 0),
+            "lines": [{"code": line["code"], "name": line["name"], "qty": line["qty"], "unit": line["unit"]}
+                      for line in lines],
+            "total": order["total"] or cart_total(lines), "created": _ts(order["created_at"]) or 0,
+            "paid": _ts(order["paid_at"]) or 0, "expires": order["stripe_expires"] if live else 0,
+            "pay_url": url if live and url.startswith("https://checkout.stripe.com/") else "",
+            "thread_url": channel_link(order["thread_id"]) or "", "web": bool(order["web_nonce"]),
+            "progress": donate_progress(order, lines) if status in ("paid", "delivered") else [],
+            "ckx": ckx, "ingame": ingame, "needs_name": ckx and not ckx_link.valid_ingame(ingame),
+            "actions": actions}
 
 
 class WebShop:
@@ -4897,6 +5162,31 @@ class WebShop:
     def end_sessions(uid: int):
         """ออกจากระบบ = session ทุกเครื่องของคนนี้ใช้ไม่ได้"""
         db.set_setting(f"web:sv:{uid}", int(db.setting(f"web:sv:{uid}", "0") or 0) + 1)
+
+    @staticmethod
+    def is_editor(member) -> bool:
+        """แก้ร้านบนเว็บได้ไหม: WEB_EDITOR_IDS · ไม่ตั้ง = เจ้าของเซิฟ Discord คนเดียว"""
+        if member is None:
+            return False
+        if cfg.web_editor_ids:
+            return member.id in cfg.web_editor_ids
+        owner = getattr(getattr(member, "guild", None), "owner_id", None)
+        return owner is not None and member.id == owner
+
+    @staticmethod
+    def admin_catalog() -> list:
+        """ของทุกชิ้น (รวมที่ซ่อน/หมดเวลา) + ค่าดิบสำหรับฟอร์มแก้ — ส่งให้คนแก้ร้านเท่านั้น"""
+        now = datetime.now(timezone.utc)
+        out = []
+        for i in db.shop_items(active_only=False):
+            d = web_item(i, now)
+            d["raw"] = {"code": i["code"], "name": i["name"], "description": i["description"], "price": i["price"],
+                        "ckx": (i["ckx"] or "").replace(";", " "), "category": i["category"],
+                        "limit": i["per_user_limit"], "stock": i["stock"], "start": _local_input(i["start_at"]),
+                        "end": _local_input(i["end_at"]), "active": bool(i["active"]), "sort": i["sort"],
+                        "image_url": d["image_url"]}
+            out.append(d)
+        return out
 
     @staticmethod
     def catalog() -> list:
@@ -4959,7 +5249,10 @@ class WebShop:
                                      db.redeemed_qty(uid, item["code"]) >= item["per_user_limit"] else "หมดแล้ว")
         wallet_url = (f"https://discord.com/channels/{cfg.guild_id}/{w['thread_id']}" if w["thread_id"]
                       else channel_link(cfg.spin_channel) or "")
-        return {"member": True, "id": str(uid), "name": member.display_name,
+        spin = db.spin_today(uid, today_key())
+        return {"member": True, "id": str(uid), "name": member.display_name, "editor": self.is_editor(member),
+                "stats": db.redeem_stats(uid), "spin_today": spin["cookies"] if spin else None,
+                "spin_url": channel_link(cfg.spin_channel) or "",
                 "avatar": str(member.display_avatar.url) if getattr(member, "display_avatar", None) else "",
                 "balance": w["balance"], "ingame": w["ingame"] or "", "can_redeem": ok, "reason": why_not,
                 "caps": caps, "why": why, "wallet_url": wallet_url,
@@ -4986,8 +5279,8 @@ class WebShop:
             if not code or isinstance(qty, bool) or not isinstance(qty, int) or not 1 <= qty <= MAX_REDEEM_QTY:
                 return fail(400, "จำนวนไม่ถูกต้อง")
             wanted.append((code, qty))
-        if len(wanted) > MAX_CART_LINES:
-            return fail(400, f"ตะกร้าใส่ได้สูงสุด {MAX_CART_LINES} รายการ")
+        if len(wanted) > WEB_CART_LINES:
+            return fail(400, f"ตะกร้าใส่ได้สูงสุด {WEB_CART_LINES} รายการ")
         ingame = str(data.get("ingame") or "").strip()
         expected = data.get("expected_total")
 
@@ -5063,6 +5356,559 @@ class WebShop:
         if replay:
             body["replay"] = True
         return 200, body
+
+
+    # ---------------- แก้ร้านบนเว็บ (เฉพาะคนแก้ร้าน) ----------------
+    async def _editor(self, uid: int):
+        member = await self.member(uid)
+        return member if self.is_editor(member) else None
+
+    async def is_editor_uid(self, uid: int) -> bool:
+        """เช็คก่อนรับไฟล์อัปโหลด (ไม่ให้คนอื่นส่งไฟล์ใหญ่มาให้เซิฟอ่าน)"""
+        try:
+            return await self._editor(uid) is not None
+        except discord.HTTPException:
+            return False
+
+    async def admin_save(self, uid: int, data: dict, image: Optional[bytes], remove_image: bool) -> tuple:
+        def fail(status, msg):
+            return status, {"ok": False, "error": msg}
+
+        member = await self._editor(uid)
+        if member is None:
+            return fail(403, "บัญชีนี้แก้ร้านไม่ได้")
+        original = str(data.get("original") or "").strip()
+        item = db.shop_get(original) if original else None
+        if original and item is None:
+            return fail(404, f"ไม่พบ {original} แล้ว (อาจถูกลบไป) รีเฟรชหน้า")
+        code = str(data.get("code") or "").strip()
+        if not ITEM_CODE_RE.fullmatch(code):
+            return fail(400, "รหัสของใช้ได้แค่อังกฤษ ตัวเลข _ - ยาวไม่เกิน 20 ตัว")
+        clash = db.shop_get(code)
+        if clash and (item is None or clash["code"].casefold() != item["code"].casefold()):
+            return fail(409, f"รหัส {code} มีของอื่นใช้อยู่แล้ว")
+        name = str(data.get("name") or "").strip()
+        if not name:
+            return fail(400, "ใส่ชื่อของ")
+
+        def num(key, lo, hi, default):
+            raw = str(data.get(key, "")).strip()
+            if raw == "":
+                return default
+            try:
+                v = int(raw)
+            except ValueError:
+                raise ValueError(key)
+            if not lo <= v <= hi:
+                raise ValueError(key)
+            return v
+
+        labels = {"price": "ราคา (1–100,000,000)", "limit": "จำกัดต่อคน (0–999)", "stock": "สต็อก (-1–1,000,000)",
+                  "sort": "ลำดับ"}
+        try:
+            price = num("price", 1, 100_000_000, None)
+            limit = num("limit", 0, 999, 0)
+            stock = num("stock", -1, 1_000_000, -1)
+            sort = num("sort", -100_000, 100_000, 0)
+        except ValueError as e:
+            return fail(400, f"ช่อง {labels.get(str(e), str(e))} ไม่ถูกต้อง")
+        if price is None:
+            return fail(400, "ใส่ราคา (คุกกี้)")
+        ckx_text = str(data.get("ckx") or "").strip()
+        try:
+            ckx = ckx_link.normalize_items(ckx_text) if ckx_text else ""
+        except ValueError as e:
+            return fail(400, str(e))
+        try:
+            start_at = parse_when(str(data.get("start") or "").replace("T", " "))
+            end_at = parse_when(str(data.get("end") or "").replace("T", " "), end=True)
+        except app_commands.AppCommandError as e:
+            return fail(400, str(e))
+        if start_at and end_at and end_at <= start_at:
+            return fail(400, "เวลาจบต้องหลังเวลาเริ่ม")
+        active = str(data.get("active", "1")).lower() in ("1", "true", "on", "yes")
+        image_name = None
+        if image:
+            if len(image) > 8 * 1024 * 1024:
+                return fail(413, "รูปใหญ่เกิน 8 MB")
+            ext = sniff_image(image)
+            if ext is None:
+                return fail(400, "รูปต้องเป็น png / jpg / webp / gif")
+            image_name = write_item_image(code, ext, image)
+        elif remove_image and item is not None and item["image"]:
+            image_name = ""
+        # รูปเก่าของของชิ้นนี้ ลบหลังบันทึกสำเร็จ (บันทึกพัง = ของไม่ชี้ไปไฟล์ที่หายไปแล้ว)
+        old_image = item["image"] if image_name is not None and item is not None else ""
+        fields = dict(name=trunc(name, 80), description=trunc(str(data.get("description") or "").strip(), 500),
+                      price=price, ckx=ckx, category=trunc(str(data.get("category") or "").strip(), 40),
+                      per_user_limit=limit, stock=stock, start_at=start_at.isoformat() if start_at else "",
+                      end_at=end_at.isoformat() if end_at else "", active=int(active), sort=sort)
+        loaded = str(data.get("stock_loaded", "")).strip()
+        if item is not None and loaded and str(data.get("stock", "")).strip() == loaded:
+            fields.pop("stock")  # ไม่ได้แก้ช่องสต็อก → ใช้ค่าจริงตอนนี้ (กันเขียนทับของที่เพิ่งมีคนแลกไป)
+        if item is None:
+            db.shop_add(code=code, image=image_name or "", **fields)
+            verb = "เพิ่ม"
+        else:  # เปลี่ยนรหัสแต่ไม่เปลี่ยนรูป → ใช้ไฟล์รูปเดิมต่อ (image=None = ไม่แตะ)
+            db.shop_update(item["code"], code=code, image=image_name, **fields)
+            verb = "แก้"
+        if old_image:
+            drop_item_image(old_image)
+        guild = bot.get_guild(cfg.guild_id)
+        await mod_log(guild, f"🛍️ {member.mention} {verb}ของในร้านผ่านเว็บ `{code}` {trunc(name, 80)} "
+                             f"{fmt_cookies(price)}" + ("" if active else " (ซ่อน)"))
+        log.info("เว็บ: %s %sของ %s", uid, verb, code)
+        return 200, {"ok": True, "code": code}
+
+    async def admin_delete(self, uid: int, data: dict) -> tuple:
+        member = await self._editor(uid)
+        if member is None:
+            return 403, {"ok": False, "error": "บัญชีนี้แก้ร้านไม่ได้"}
+        item = db.shop_get(str(data.get("code") or "").strip())
+        if item is None or not db.shop_delete(item["code"]):
+            return 404, {"ok": False, "error": "ไม่พบของนี้แล้ว"}
+        drop_item_image(item["image"])
+        await mod_log(bot.get_guild(cfg.guild_id),
+                      f"🗑️ {member.mention} ลบของในร้านผ่านเว็บ `{item['code']}` {item['name']}")
+        return 200, {"ok": True}
+
+    async def admin_category(self, uid: int, data: dict) -> tuple:
+        """คำอธิบายหมวด: บรรทัดขึ้นต้น ! = กล่องเตือนสีชมพู · * = กล่องข้อมูลสีเขียว"""
+        member = await self._editor(uid)
+        if member is None:
+            return 403, {"ok": False, "error": "บัญชีนี้แก้ร้านไม่ได้"}
+        name = str(data.get("name") or "").strip()
+        if not name or name not in {i["category"] for i in db.shop_items(active_only=False) if i["category"]}:
+            return 404, {"ok": False, "error": "ไม่มีหมวดนี้แล้ว"}
+        info = web_cat_info()
+        desc = trunc(str(data.get("desc") or "").strip(), 1500)
+        if desc:
+            info[name] = desc
+        else:
+            info.pop(name, None)
+        db.set_setting("web:catinfo", json.dumps(info, ensure_ascii=False))
+        await mod_log(bot.get_guild(cfg.guild_id), f"📝 {member.mention} แก้คำอธิบายหมวด {trunc(name, 40)} บนเว็บ")
+        return 200, {"ok": True}
+
+    async def admin_page(self, uid: int, data: dict) -> tuple:
+        member = await self._editor(uid)
+        if member is None:
+            return 403, {"ok": False, "error": "บัญชีนี้แก้ร้านไม่ได้"}
+        for key, n in (("title", 60), ("subtitle", 200), ("notice", 300)):
+            value = trunc(str(data.get(key) or "").strip(), n)
+            db.set_setting(f"web:{key}", value or None)
+        await mod_log(bot.get_guild(cfg.guild_id), f"📝 {member.mention} แก้ข้อความหน้าเว็บร้าน")
+        return 200, {"ok": True}
+
+    @staticmethod
+    def site() -> dict:
+        return web_site.load(db.setting("web:site"))
+
+    async def admin_site(self, uid: int, data: dict, files: dict, removes: set) -> tuple:
+        """แก้หน้าเว็บ 1 ช่อง (โลโก้/ปุ่มลัด/แบนเนอร์/โปรโมต/รูปหมวด/ของตกแต่ง/ธีม/หัวหน้า Donate)
+        files = {ช่องรูป: bytes} · removes = ช่องรูปที่จะลบ"""
+        def fail(status, msg):
+            return status, {"ok": False, "error": msg}
+
+        member = await self._editor(uid)
+        if member is None:
+            return fail(403, "บัญชีนี้แก้หน้าเว็บไม่ได้")
+        address, action = str(data.get("slot") or ""), str(data.get("action") or "save")
+        try:
+            slot, key = web_site.parse_address(address)
+        except web_site.SiteError as e:
+            return fail(400, str(e))
+        if slot == "cats" and action == "save":
+            names = {i["category"] for i in db.shop_items(active_only=False) if i["category"]}
+            if key not in names:
+                return fail(404, "ไม่มีหมวดนี้แล้ว")
+        allowed = web_site.SLOTS[slot]["images"]
+        rate = None
+        raw_rate, loaded_rate = str(data.get("rate", "")).strip(), str(data.get("rate_loaded", "")).strip()
+        if slot == "donate" and action == "save" and raw_rate != "" and raw_rate != loaded_rate:
+            try:
+                rate = int(str(data["rate"]).strip())
+            except ValueError:
+                rate = -1
+            if not 0 <= rate <= 1_000_000:
+                return fail(400, "เรตเติมคุกกี้ต้องเป็น 0–1,000,000 (0 = ปิด)")
+        written, images = [], {}
+        try:
+            for name, blob in files.items():
+                if name not in allowed or not blob:
+                    continue
+                if len(blob) > 8 * 1024 * 1024:
+                    return fail(413, "รูปใหญ่เกิน 8 MB")
+                ext = sniff_image(blob)
+                if ext is None:
+                    return fail(400, "รูปต้องเป็น png / jpg / webp / gif")
+                images[name] = write_item_image(f"s-{slot}-{name}", ext, blob)
+                written.append(images[name])
+            for name in removes:
+                if name in allowed and name not in images:
+                    images[name] = ""
+            fields = {k: v for k, v in data.items() if k not in ("slot", "action", "rate", "rate_loaded", "rev")}
+            async with _site_lock:
+                rev = str(data.get("rev") or "")
+                if rev and rev != site_rev():  # อีกแท็บ/อีกคนเพิ่งแก้ → ลำดับแบนเนอร์อาจเลื่อนไปแล้ว
+                    return fail(409, "หน้าเว็บเพิ่งถูกแก้จากอีกหน้าต่าง รีเฟรชก่อนแล้วแก้ใหม่")
+                current, stale = self.site(), set()
+                names = {i["category"] for i in db.shop_items(active_only=False) if i["category"]}
+                for name in [k for k in current["cats"] if k not in names]:  # หมวดที่ไม่มีแล้ว → ล้างทิ้ง
+                    stale.add(current["cats"].pop(name).get("img") or "")
+                try:
+                    new, dropped = web_site.update(current, address, action, fields, images)
+                except web_site.SiteError as e:
+                    return fail(400, str(e))
+                dropped = set(dropped) | {x for x in stale if x}
+                db.set_setting("web:site", web_site.dump(new))
+                written = []  # บันทึกแล้ว ไม่ต้องลบทิ้ง
+            if rate is not None:
+                db.set_setting("cookie_rate", rate)
+        finally:
+            for name in written:  # บันทึกไม่ผ่าน → ไม่ทิ้งไฟล์ขยะไว้
+                drop_item_image(name)
+        for name in dropped:
+            drop_item_image(name)
+        what = {"logo": "โลโก้", "tiles": "ปุ่มลัด", "hero": "แบนเนอร์", "promos": "การ์ดโปรโมต", "cats": "รูปหมวด",
+                "deco": "ของตกแต่ง", "theme": "สีธีม", "donate": "หัวหน้า Donate"}[slot]
+        verb = {"delete": "ลบ/รีเซ็ต", "up": "เลื่อน", "down": "เลื่อน"}.get(action, "แก้")
+        await mod_log(bot.get_guild(cfg.guild_id), f"🎨 {member.mention} {verb}{what}บนเว็บ"
+                                                   + (f" · เรตเติมคุกกี้ 1 บาท = {rate:,}" if rate is not None else ""))
+        return 200, {"ok": True}
+
+    @staticmethod
+    def donate_admin_catalog() -> list:
+        """รายการ Donate ทั้งหมด (รวมที่ปิด) + ค่าดิบสำหรับฟอร์ม — ส่งให้คนแก้ร้านเท่านั้น"""
+        out = []
+        for i in db.items(active_only=False):
+            d = donate_item_web(i)
+            d["raw"] = {"code": i["code"], "name": i["name"], "description": i["description"],
+                        "price": f"{i['price'] / 100:.2f}".rstrip("0").rstrip("."), "cookies": i["cookies"],
+                        "ckx": (i["ckx"] or "").replace(";", " "), "active": bool(i["active"]), "sort": i["sort"],
+                        "image_url": d["image_url"]}
+            out.append(d)
+        return out
+
+    async def admin_donate_item(self, uid: int, data: dict, image: Optional[bytes], remove_image: bool) -> tuple:
+        """เพิ่ม/แก้รายการ Donate บนเว็บ (แทน /item add · /item edit)"""
+        def fail(status, msg):
+            return status, {"ok": False, "error": msg}
+
+        member = await self._editor(uid)
+        if member is None:
+            return fail(403, "บัญชีนี้แก้ร้านไม่ได้")
+        original = str(data.get("original") or "").strip()
+        item = db.item_get(original) if original else None
+        if original and item is None:
+            return fail(404, f"ไม่พบ {original} แล้ว (อาจถูกลบไป) รีเฟรชหน้า")
+        code = str(data.get("code") or "").strip()
+        if not ITEM_CODE_RE.fullmatch(code) or code.upper() == TOPUP_CODE:
+            return fail(400, "รหัสใช้ได้แค่อังกฤษ ตัวเลข _ - ยาวไม่เกิน 20 ตัว (ห้ามใช้ TOPUP)")
+        clash = db.item_get(code)
+        if clash and (item is None or clash["code"].casefold() != item["code"].casefold()):
+            return fail(409, f"รหัส {code} มีรายการอื่นใช้อยู่แล้ว")
+        name = str(data.get("name") or "").strip()
+        if not name:
+            return fail(400, "ใส่ชื่อรายการ")
+        try:
+            price = parse_baht(str(data.get("price") or ""))
+        except ValueError:
+            return fail(400, "ราคาไม่ถูกต้อง — ใส่ตัวเลขบาท เช่น 50 หรือ 49.50")
+        if price > 10_000_000:
+            return fail(400, "ราคาสูงเกินไป")
+        try:
+            cookies = int(str(data.get("cookies") or "0").strip() or 0)
+            sort = int(str(data.get("sort") or "0").strip() or 0)
+        except ValueError:
+            return fail(400, "ช่องคุกกี้/ลำดับต้องเป็นตัวเลข")
+        if not 0 <= cookies <= 10_000_000 or not -100_000 <= sort <= 100_000:
+            return fail(400, "ช่องคุกกี้ (0–10,000,000) หรือลำดับไม่ถูกต้อง")
+        ckx_text = str(data.get("ckx") or "").strip()
+        try:
+            ckx = ckx_link.normalize_items(ckx_text) if ckx_text else ""
+        except ValueError as e:
+            return fail(400, str(e))
+        if ckx and ckx_link.max_count(ckx) * cfg.donate_max_qty > ckx_link.MAX_COUNT:
+            return fail(400, f"จำนวนในรหัส × จำนวนสูงสุดต่อรายการ ({cfg.donate_max_qty}) ต้องไม่เกิน {ckx_link.MAX_COUNT}")
+        active = str(data.get("active", "1")).lower() in ("1", "true", "on", "yes")
+        image_name = None
+        if image:
+            if len(image) > 8 * 1024 * 1024:
+                return fail(413, "รูปใหญ่เกิน 8 MB")
+            ext = sniff_image(image)
+            if ext is None:
+                return fail(400, "รูปต้องเป็น png / jpg / webp / gif")
+            image_name = write_item_image(f"d-{code}", ext, image)
+        elif remove_image and item is not None and item["image"]:
+            image_name = ""
+        old_image = item["image"] if image_name is not None and item is not None else ""
+        fields = dict(name=trunc(name, 80), price=price, description=trunc(str(data.get("description") or "").strip(), 200),
+                      sort=sort, cookies=cookies, ckx=ckx, active=int(active))
+        if item is None:
+            db.item_add(code, image=image_name or "", **fields)
+            verb = "เพิ่ม"
+        else:
+            db.item_update(item["code"], code=code, image=image_name, **fields)
+            verb = "แก้"
+        if old_image:
+            drop_item_image(old_image)
+        await mod_log(bot.get_guild(cfg.guild_id), f"🧾 {member.mention} {verb}รายการ Donate ผ่านเว็บ `{code}` "
+                                                   f"{trunc(name, 80)} {fmt_baht(price)}" + ("" if active else " (ปิด)"))
+        return 200, {"ok": True, "code": code}
+
+    async def admin_donate_delete(self, uid: int, data: dict) -> tuple:
+        member = await self._editor(uid)
+        if member is None:
+            return 403, {"ok": False, "error": "บัญชีนี้แก้ร้านไม่ได้"}
+        item = db.item_get(str(data.get("code") or "").strip())
+        if item is None or not db.item_delete(item["code"]):
+            return 404, {"ok": False, "error": "ไม่พบรายการนี้แล้ว"}
+        drop_item_image(item["image"])
+        await mod_log(bot.get_guild(cfg.guild_id),
+                      f"🧾 {member.mention} ลบรายการ Donate ผ่านเว็บ `{item['code']}` {item['name']}")
+        return 200, {"ok": True}
+
+    # ---------------- Donate (จ่ายบนเว็บ · บอทโพสต์ในห้อง Donate ให้) ----------------
+    @staticmethod
+    def donate_enabled() -> bool:
+        return bool(cfg.donate_enabled and stripe is not None)
+
+    @staticmethod
+    def donate_catalog() -> dict:
+        return {"items": [donate_item_web(i) for i in db.items()], "rate": donate_rate(), "min": cfg.donate_min,
+                "max_qty": cfg.donate_max_qty, "max_lines": MAX_CART_LINES, "topup_max": DONATE_TOPUP_MAX}
+
+    @staticmethod
+    def donate_meta() -> dict:
+        items, meta = web_page_data()
+        meta = dict(meta, intro=DONATE_INTRO, minutes=cfg.stripe_session_minutes, shop_items=items,
+                    cookie_rate=donate_rate())
+        return meta
+
+    @staticmethod
+    def donate_orders(uid: int) -> list:
+        return [donate_brief(o) for o in db.orders_of(uid, 8)]
+
+    @staticmethod
+    def _own_order(uid: int, data):
+        oid = data.get("id") if isinstance(data, dict) else None
+        if isinstance(oid, bool) or not isinstance(oid, int):
+            return None
+        order = db.order_get(oid)
+        return order if order is not None and order["owner_id"] == uid else None
+
+    async def _donate_room(self, guild, member):
+        """ห้อง Donate ของคนนี้ — ใช้ห้องที่เปิดอยู่ หรือเปิดห้องใหม่ให้ (เหมือนกดปุ่ม Donate ในดิส)"""
+        for t in db.open_tickets(member.id, "donate"):
+            thread = guild.get_thread(t["channel_id"])
+            if thread is None:
+                try:
+                    thread = await guild.fetch_channel(t["channel_id"])
+                except discord.NotFound:  # ห้องถูกลบไปแล้ว → ปิดในระบบ แล้วเปิดใหม่
+                    db.set_status(t["id"], "closed")
+                    continue
+            if getattr(thread, "archived", False):
+                try:
+                    await thread.edit(archived=False)
+                except discord.HTTPException as e:
+                    log.warning("unarchive ห้อง Donate %s ไม่ได้: %s", thread.id, e)
+            try:  # ออกจากเซิฟแล้วกลับมา = หลุดจากห้องส่วนตัว → ดึงกลับเข้าห้อง ให้เห็นการ์ดจ่ายเงิน/สถานะ
+                await thread.add_user(member)
+            except discord.HTTPException as e:
+                log.warning("ดึง %s เข้าห้อง Donate ไม่ได้: %s", member.id, e)
+            return thread, t, None
+        thread, err = await open_ticket_thread(guild, member, TICKET_TYPES["donate"], {}, via="web")
+        if thread is None:
+            return None, None, err
+        return thread, db.by_channel(thread.id), None
+
+    async def donate_checkout(self, uid: int, data) -> tuple:
+        """สั่ง Donate จากเว็บ → ออเดอร์ในห้อง Donate ของคนนี้ + บิล Stripe — คืน (HTTP status, JSON)"""
+        def fail(status, msg, code="bad", **extra):
+            return status, {"ok": False, "error": msg, "code": code, **extra}
+
+        if not self.donate_enabled():
+            return fail(503, "ระบบ Donate ยังไม่เปิด", "off")
+        if not isinstance(data, dict):
+            return fail(400, "ข้อมูลไม่ถูกต้อง")
+        nonce = str(data.get("nonce") or "")
+        if not NONCE_RE.fullmatch(nonce):
+            return fail(400, "ข้อมูลไม่ถูกต้อง รีเฟรชหน้าแล้วลองใหม่")
+        raw = data.get("items") or []
+        if not isinstance(raw, list):
+            return fail(400, "ข้อมูลไม่ถูกต้อง")
+        wanted = []
+        for line in raw:
+            if not isinstance(line, dict):
+                return fail(400, "ข้อมูลไม่ถูกต้อง")
+            code, qty = str(line.get("code") or "").strip(), line.get("qty")
+            if not code or isinstance(qty, bool) or not isinstance(qty, int) or not 1 <= qty <= cfg.donate_max_qty:
+                return fail(400, f"จำนวนต่อรายการต้องอยู่ระหว่าง 1–{cfg.donate_max_qty}")
+            wanted.append((code, qty))
+        topup = data.get("topup") or 0
+        if isinstance(topup, bool) or not isinstance(topup, int) or not 0 <= topup <= DONATE_TOPUP_MAX:
+            return fail(400, "ยอดเติมคุกกี้ไม่ถูกต้อง")
+        if not wanted and not topup:
+            return fail(400, "ยังไม่ได้เลือกรายการ")
+        if len(wanted) + (1 if topup else 0) > MAX_CART_LINES:
+            return fail(400, f"ใส่ได้สูงสุด {MAX_CART_LINES} รายการต่อรอบ")
+        ingame = str(data.get("ingame") or "").strip()
+        expected = data.get("expected_total")
+
+        superseded = []
+        async with user_lock(uid):
+            old = db.order_by_nonce(uid, nonce)
+            if old is not None:  # กดซ้ำ / เน็ตหลุดแล้วส่งใหม่ → ใช้ออเดอร์เดิม ไม่สร้างบิลซ้ำ
+                return await self._donate_resume(uid, old)
+            member = await self.member(uid)
+            if member is None:
+                return fail(401, "บัญชีนี้ไม่ได้อยู่ในเซิฟ Discord แล้ว", "login")
+            lines = []
+            try:
+                for code, qty in wanted:
+                    lines = cart_add(lines, db.item_get(code), qty, cfg.donate_max_qty)
+            except CartError as e:
+                return fail(409, str(e), "changed", catalog=self.donate_catalog())
+            if topup:
+                rate = donate_rate()
+                if rate <= 0:
+                    return fail(409, "ตอนนี้ปิดเติมคุกกี้ตามยอดอยู่", "changed", catalog=self.donate_catalog())
+                satang = topup * 100
+                if satang < cfg.donate_min:
+                    return fail(400, f"เติมคุกกี้ขั้นต่ำ {fmt_baht(cfg.donate_min)}")
+                cookies = satang * rate // 100
+                lines.append({"code": TOPUP_CODE, "name": f"เติมคุกกี้ {cookies:,} 🍪", "unit": satang, "qty": 1,
+                              "cookies": cookies, "ckx": ""})
+            total = cart_total(lines)
+            if isinstance(expected, int) and not isinstance(expected, bool) and expected != total:
+                return fail(409, "ราคาเพิ่งเปลี่ยน ดูยอดใหม่แล้วกดอีกครั้ง", "changed", catalog=self.donate_catalog())
+            if total < cfg.donate_min:
+                return fail(400, f"ยอดขั้นต่ำต่อรอบคือ {fmt_baht(cfg.donate_min)}")
+            guild = bot.get_guild(cfg.guild_id)
+            if order_ckx_lines(lines):
+                if not ckx_link.valid_ingame(ingame):
+                    return fail(400, "ใส่ชื่อในเกมที่จะรับของ (ห้ามมี \" | ` และยาวไม่เกิน 40 ตัว)", "ingame")
+                for line in order_ckx_lines(lines):
+                    try:
+                        ckx_link.normalize_items(line["ckx"], multiply=line["qty"])
+                    except ValueError as e:  # รหัสของในรายการตั้งผิด/จำนวนเกิน → ไม่ให้จ่ายก่อนแล้วส่งไม่ได้
+                        await mod_log(guild, f"❌ Donate บนเว็บ: รหัสของ `{line['code']}` ใช้ไม่ได้ ({e})", COLOR_BAD)
+                        return fail(409, f"{line['name']} × {line['qty']} ส่งเข้าเกมไม่ได้ — ลดจำนวน หรือแจ้งแอดมิน",
+                                    "broken")
+            else:
+                ingame = ""
+            thread, ticket, err = await self._donate_room(guild, member)
+            if thread is None:
+                return fail(503, err or "เปิดห้อง Donate ไม่ได้ ลองใหม่อีกครั้ง", "room")
+            bills = [o for o in db.orders_in_thread(thread.id, ("pending",)) if o["owner_id"] == uid]
+            if bills:
+                return fail(409, f"มีบิล #{bills[0]['id']:04d} รอจ่ายอยู่ — จ่ายบิลเดิม หรือยกเลิกก่อนแล้วสั่งใหม่",
+                            "open_bill", order=donate_brief(bills[0]))
+            for o in db.orders_in_thread(thread.id, ("cart", "review", "expired")):  # ตะกร้า/บิลเก่าที่ค้าง → แทนด้วยอันใหม่
+                if o["owner_id"] != uid:
+                    continue
+                async with order_lock(o["id"]):
+                    now_o = db.order_get(o["id"])
+                    if now_o["status"] == "pending":  # เพิ่งได้บิล (กดในดิสพร้อมกัน) → ไม่สร้างใบที่สอง
+                        return fail(409, f"มีบิล #{o['id']:04d} รอจ่ายอยู่ — จ่ายบิลเดิม หรือยกเลิกก่อนแล้วสั่งใหม่",
+                                    "open_bill", order=donate_brief(now_o))
+                    if now_o["status"] in ("cart", "review", "expired"):
+                        db.order_update(o["id"], status="cancelled")
+                        superseded.append(o["id"])
+            for oid in superseded:
+                spawn(post_order_card(oid, title="ยกเลิกแล้ว — สั่งใหม่จากหน้าเว็บ"), f"Donate #{oid:04d}")
+            if ingame:
+                db.wallet_update(uid, ingame=ingame)
+            order_id = db.order_create_web(ticket["id"], thread.id, uid, nonce, lines, total, ingame)
+            if order_id is None:
+                return await self._donate_resume(uid, db.order_by_nonce(uid, nonce))
+            log.info("เว็บ: %s สั่ง Donate #%04d %s", uid, order_id, fmt_baht(total))
+            return await self._donate_bill(order_id, note=f"🌐 <@{uid}> สั่ง Donate จากหน้าเว็บ — "
+                                                          "จ่ายต่อได้ที่หน้าเว็บ หรือกดปุ่มด้านล่าง")
+
+    async def _donate_bill(self, order_id: int, note: str = "") -> tuple:
+        """สร้างบิล (ถ้ายังไม่มี) แล้วตอบลิงก์จ่าย — ผู้เรียกต้องถือ user_lock(เจ้าของ) อยู่ (บิลทีละใบต่อคน)"""
+        guild = bot.get_guild(cfg.guild_id)
+        err = None
+        async with order_lock(order_id):
+            if db.order_get(order_id)["status"] in ("review", "expired"):
+                _, err = await _bill_locked(order_id, guild, via="web")
+        spawn(post_order_card(order_id, note=note), f"การ์ด Donate #{order_id:04d}")
+        brief = donate_brief(db.order_get(order_id))
+        if err:  # ออเดอร์ยังอยู่ (รอยืนยัน) — กดจ่ายใหม่ได้ทั้งบนเว็บและในดิส
+            return 502, {"ok": False, "error": err, "code": "bill", "order": brief}
+        if brief["status"] in ("paid", "delivered"):
+            return 200, {"ok": True, "order": brief, "paid": True}
+        if not brief["pay_url"]:
+            return 502, {"ok": False, "error": "บิลนี้ใช้ไม่ได้แล้ว กดสร้างบิลใหม่", "code": "bill", "order": brief}
+        return 200, {"ok": True, "order": brief, "pay_url": brief["pay_url"]}
+
+    async def _donate_resume(self, uid: int, order) -> tuple:
+        """ออเดอร์เดิม (nonce ซ้ำ / กดจ่ายต่อ) — ผู้เรียกต้องถือ user_lock(uid) อยู่"""
+        if order["status"] == "pending" and not donate_brief(order)["pay_url"]:
+            await sync_payment(order["id"])  # เลยเวลาบิลแล้ว → ให้ Stripe ยืนยันก่อน
+            order = db.order_get(order["id"])
+        if order["status"] == "cancelled":
+            return 409, {"ok": False, "error": "รายการนี้ถูกยกเลิกแล้ว", "code": "cancelled",
+                         "order": donate_brief(order)}
+        if order["status"] == "expired":
+            return 409, {"ok": False, "error": "บิลนี้หมดอายุแล้ว — กดสร้างบิลใหม่ที่รายการ", "code": "expired",
+                         "order": donate_brief(order)}
+        return await self._donate_bill(order["id"])
+
+    async def donate_pay(self, uid: int, data) -> tuple:
+        """ยืนยัน/จ่ายต่อ/สร้างบิลใหม่ ของออเดอร์ตัวเอง (รวมออเดอร์ที่สั่งในห้อง Donate บน Discord)"""
+        if not self.donate_enabled():
+            return 503, {"ok": False, "error": "ระบบ Donate ยังไม่เปิด", "code": "off"}
+        order = self._own_order(uid, data)
+        if order is None:
+            return 404, {"ok": False, "error": "ไม่พบรายการนี้"}
+        if await self.member(uid) is None:
+            return 401, {"ok": False, "error": "บัญชีนี้ไม่ได้อยู่ในเซิฟ Discord แล้ว", "code": "login"}
+        async with user_lock(uid):  # บิลทีละใบต่อคน (เหมือนตอนสั่ง และปุ่มในดิส)
+            order = db.order_get(order["id"])
+            if order["status"] in ("review", "expired"):
+                lines = lines_of(order)
+                if order_ckx_lines(lines):
+                    name = order_ingame(order)
+                    if not ckx_link.valid_ingame(name):
+                        name = str(data.get("ingame") or "").strip()
+                        if not ckx_link.valid_ingame(name):
+                            return 400, {"ok": False, "code": "ingame",
+                                         "error": "ใส่ชื่อในเกมที่จะรับของ (ห้ามมี \" | ` และยาวไม่เกิน 40 ตัว)"}
+                        db.wallet_update(uid, ingame=name)
+                    if order["ingame"] != name:
+                        db.order_update(order["id"], ingame=name)
+                return await self._donate_bill(order["id"])
+            return await self._donate_resume(uid, order)
+
+    async def donate_check(self, uid: int, data) -> tuple:
+        order = self._own_order(uid, data)
+        if order is None:
+            return 404, {"ok": False, "error": "ไม่พบรายการนี้"}
+        now = time.monotonic()
+        if order["status"] == "pending" and now - _donate_checked.get(order["id"], 0) >= 3:
+            _donate_checked[order["id"]] = now
+            await sync_payment(order["id"])
+        return 200, {"ok": True, "order": donate_brief(db.order_get(order["id"]))}
+
+    async def donate_cancel(self, uid: int, data) -> tuple:
+        order = self._own_order(uid, data)
+        if order is None:
+            return 404, {"ok": False, "error": "ไม่พบรายการนี้"}
+        async with order_lock(order["id"]):
+            result, text = await _cancel_locked(order["id"])
+        if result == "paid":
+            await sync_payment(order["id"])
+            return 409, {"ok": False, "error": "บิลนี้จ่ายแล้ว ยกเลิกไม่ได้", "code": "paid",
+                         "order": donate_brief(db.order_get(order["id"]))}
+        if result != "cancelled":
+            return (409 if result == "closed" else 502), {"ok": False, "error": text,
+                                                          "order": donate_brief(db.order_get(order["id"]))}
+        spawn(post_order_card(order["id"], title="ยกเลิกแล้ว (จากหน้าเว็บ)"), f"Donate #{order['id']:04d}")
+        await mod_log(bot.get_guild(cfg.guild_id), f"❌ <@{uid}> ยกเลิก Donate #{order['id']:04d} บนเว็บ")
+        return 200, {"ok": True, "order": donate_brief(db.order_get(order["id"]))}
 
 
 web_shop = WebShop()
@@ -5163,13 +6009,7 @@ async def save_item_image(code: str, attachment: discord.Attachment) -> str:
     if attachment.size > 8 * 1024 * 1024:
         raise app_commands.AppCommandError("รูปใหญ่เกิน 8 MB")
     data = await attachment.read()
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", code).lower()
-    for old in IMAGES_DIR.glob(f"{safe}.*"):
-        old.unlink(missing_ok=True)
-    name = f"{safe}.{ext}"
-    (IMAGES_DIR / name).write_bytes(data)
-    return name
+    return write_item_image(code, ext, data)
 
 
 async def start_web():
@@ -5430,6 +6270,19 @@ def check_ticket_channel(guild) -> list:
     return out
 
 
+def web_editor_check(guild) -> list:
+    """ใครแก้หน้าเว็บได้ (ล็อกไว้ที่ WEB_EDITOR_IDS · ไม่ตั้ง = เจ้าของเซิฟ Discord คนเดียว)"""
+    if cfg.web_editor_ids:
+        out = [("🔒", "แก้หน้าเว็บได้เฉพาะ (WEB_EDITOR_IDS): " + ", ".join(f"<@{i}>" for i in cfg.web_editor_ids))]
+        gone = [i for i in cfg.web_editor_ids if guild.get_member(i) is None]
+        if gone:
+            out.append(("⚠️", "WEB_EDITOR_IDS มี ID ที่ไม่อยู่ในดิสนี้: " + ", ".join(str(i) for i in gone)))
+        return out
+    owner = getattr(guild, "owner_id", None)
+    return [("🔒", f"แก้หน้าเว็บได้เฉพาะเจ้าของเซิฟ: <@{owner}> · อยากล็อกเป็นคนอื่น ใส่ WEB_EDITOR_IDS"
+                  if owner else "แก้หน้าเว็บได้เฉพาะเจ้าของเซิฟ Discord")]
+
+
 async def run_checks(guild: discord.Guild, panel_channel=None) -> list:
     me = guild.me
     out = []
@@ -5516,6 +6369,7 @@ async def run_checks(guild: discord.Guild, panel_channel=None) -> list:
         elif cfg.public_url:
             out.append(("➖", "แลกของบนเว็บ: ยังไม่ได้ตั้ง DISCORD_CLIENT_SECRET — หน้าเว็บเป็นแคตตาล็อกดูอย่างเดียว "
                               "(แลกในดิสแทน)"))
+        out += web_editor_check(guild)
     pool = db.spin_pool()
     out.append(("✅", f"วงล้อมีรางวัล {len(pool)} แบบ") if pool else ("➖", "วงล้อยังไม่มีรางวัล (/spin add)"))
 
@@ -5882,6 +6736,7 @@ async def cmd_item_remove(interaction: discord.Interaction, code: str):
     item = db.item_get(code)
     if item is None or not db.item_delete(item["code"]):
         return await reply(interaction, f"ไม่พบรหัส `{code}`")
+    drop_item_image(item["image"])
     await reply(interaction, f"ลบ `{item['code']}` {item['name']} แล้ว")
     await mod_log(interaction.guild, f"🧾 {interaction.user.mention} ลบรายการ `{item['code']}` {item['name']}")
 
@@ -6197,6 +7052,8 @@ async def cmd_shop_edit(interaction: discord.Interaction, code: str, new_code: O
     start_at = None if start is None else (parse_when(start) or "")
     end_at = None if end is None else (parse_when(end, end=True) or "")
     image_name = await save_item_image(new_code or item["code"], image) if image else None
+    if image_name and item["image"] and item["image"] != image_name:
+        drop_item_image(item["image"])
     db.shop_update(item["code"], code=new_code, name=text(name, 80), price=price, ckx=_parse_ckx(ckx),
                    description=text(description, 500), category=text(category, 40), per_user_limit=limit, stock=stock,
                    start_at=start_at.isoformat() if start_at else start_at,
@@ -6213,8 +7070,7 @@ async def cmd_shop_remove(interaction: discord.Interaction, code: str):
     item = db.shop_get(code)
     if item is None or not db.shop_delete(item["code"]):
         return await reply(interaction, f"ไม่พบ `{code}`")
-    if item["image"]:
-        (IMAGES_DIR / item["image"]).unlink(missing_ok=True)
+    drop_item_image(item["image"])
     await reply(interaction, f"ลบ `{item['code']}` {item['name']} แล้ว")
 
 
